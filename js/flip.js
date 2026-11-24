@@ -202,7 +202,8 @@ export class FlipWatcher {
     try { this.onSample?.(this); } catch {}
 
     if (this.active) {
-      if (j.pose === "down") { this.upSince = 0; }
+      // 들지 않았는데 센서 신호가 잠깐 끊긴 것(none)은 정지 사유가 아니다 — 오탐으로 녹음이 끊기면 안 된다
+      if (j.pose === "down" || j.pose === "none") { this.upSince = 0; }
       else if (!this.upSince) this.upSince = now;
       if (this.upSince && now - this.upSince >= FLIP_RELEASE_MS) {
         this.active = false;
