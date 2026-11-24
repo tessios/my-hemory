@@ -45,6 +45,81 @@ HOME = Path.home()
 CONFIG_PATH = HOME / ".config" / "hemory" / "config.json"
 STATE_DIR = HOME / ".config" / "hemory"
 AUDIO_EXT = {".m4a", ".mp3", ".wav", ".aac", ".caf", ".ogg", ".opus", ".webm", ".mp4", ".flac"}
+STATUS_PATH = STATE_DIR / "status.json"
+LOCK_PATH = STATE_DIR / "pipeline.lock"
+LOCK_STALE_SEC = 3 * 3600          # 이보다 오래된 락은 죽은 실행으로 본다
+GROWING_SKIP_SEC = 90              # 방금 올라온 파일(업로드 중)은 건너뛴다
+DEADMAN_SEC = 3 * 3600             # 마지막 성공이 이보다 오래되면 경고
+
+
+class AuthError(RuntimeError):
+    """OAuth 토큰이 만료·해제되어 더 이상 진행할 수 없음(재인증 필요)."""
+
+
+def read_status() -> dict:
+    try:
+        return json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def write_status(**patch) -> dict:
+    cur = read_status()
+    cur.update(patch)
+    cur["updated_at"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATUS_PATH.write_text(json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.chmod(STATUS_PATH, 0o600)
+    except Exception:
+        pass
+    return cur
+
+
+def notify_mac(message: str, title: str = "Hemory") -> None:
+    """맥 알림 센터에 알린다(러너/launchd 환경에서 실패해도 무시)."""
+    try:
+        msg = message.replace('"', "'")[:180]
+        subprocess.run(
+            ["osascript", "-e",
+             f'display notification "{msg}" with title "{title}"'],
+            check=False, timeout=10,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def acquire_lock():
+    """동시에 두 번 돌지 않게 락 파일. 성공하면 파일 핸들, 실패하면 None."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if LOCK_PATH.exists():
+            age = time.time() - LOCK_PATH.stat().st_mtime
+            if age > LOCK_STALE_SEC:
+                LOCK_PATH.unlink(missing_ok=True)
+                log(f"오래된 락 파일 정리({int(age/60)}분)")
+            else:
+                return None
+        fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.write(fd, str(os.getpid()).encode())
+        return fd
+    except FileExistsError:
+        return None
+    except Exception:
+        return None
+
+
+def release_lock(fd) -> None:
+    try:
+        if fd is not None:
+            os.close(fd)
+    except Exception:
+        pass
+    try:
+        LOCK_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
 TYPES = ("meeting", "work", "meal", "daily", "study", "etc")
 
 DEFAULTS = {
@@ -234,8 +309,17 @@ class DriveBackend:
         }).encode()
         req = urllib.request.Request("https://oauth2.googleapis.com/token", data=data,
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
-        with urllib.request.urlopen(req, timeout=60) as r:
-            j = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                j = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:300]
+            if "invalid_grant" in detail or e.code in (400, 401):
+                raise AuthError(
+                    "Google 토큰이 만료되었거나 해제되었습니다(invalid_grant). "
+                    "맥에서 재인증이 필요합니다: python3 hemory_auth.py --client-secret ~/.config/hemory/client_secret.json"
+                ) from e
+            raise
         self.token["access_token"] = j["access_token"]
         self.token["expires_at"] = time.time() + int(j.get("expires_in", 3500)) - 60
         self.token_path.write_text(json.dumps(self.token, indent=2), encoding="utf-8")
@@ -711,7 +795,18 @@ def process_one(be, item: dict, cfg: dict, dry: bool = False, force: bool = Fals
         info = transcribe_gemini(item, data, cfg)
     segs = info["segments"]
     if not segs:
-        log("  · 문장이 없습니다. 건너뜀")
+        # 무음(마이크가 죽었거나 말이 없음) → 매 실행마다 다시 전사하지 않도록 휴지통으로 보낸다.
+        # 드라이브 휴지통은 30일 안에 복원할 수 있다.
+        try:
+            trash = be.folder(cfg.get("trash", "_trash"))
+            if be.kind == "local":
+                if Path(item["path"]).parent != trash:
+                    shutil.move(item["path"], Path(trash) / item["name"])
+            elif item.get("folder_id") != trash:
+                be.move(item, trash)
+            log("  · 문장이 없습니다(무음) → 휴지통으로 이동")
+        except Exception as e:
+            log(f"  · 문장이 없습니다. 건너뜀 (이동 실패: {e})")
         return None
 
     segs, diar = diarize(segs, data, item, cfg)
@@ -762,16 +857,33 @@ def list_month_folders(be) -> list:
     return [(f["id"], f["name"]) for f in j.get("files", []) if pat.match(f["name"])]
 
 
+def _too_fresh(it: dict, sec: int = GROWING_SKIP_SEC) -> bool:
+    """방금 올라와 아직 쓰이고 있을 수 있는 파일인가(업로드 중 집어가면 잘린 파일이 된다)."""
+    mt = it.get("modifiedTime") or it.get("createdTime")
+    if not mt:
+        return False
+    try:
+        t = dt.datetime.fromisoformat(str(mt).replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=dt.timezone.utc)
+    except Exception:
+        return False
+    return (dt.datetime.now(dt.timezone.utc) - t).total_seconds() < sec
+
+
 def scan_inbox(be, cfg: dict) -> list[dict]:
     inbox = be.folder(cfg["inbox"])
     items = []
     for it in be.list_audio(inbox):
+        if _too_fresh(it):
+            log(f"  · 아직 올라오는 중: {it['name']} (다음 실행에 처리)")
+            continue
         it["from_inbox"] = True
         items.append(it)
     # 월 폴더에 오디오만 있고 JSON 이 없는 경우(업로드 중단·수동 복사)도 복구
     for folder_id, _name in list_month_folders(be):
         for it in be.list_audio(folder_id):
-            if not be.has_json(folder_id, it["base"]):
+            if not be.has_json(folder_id, it["base"]) and not _too_fresh(it):
                 it["from_inbox"] = False
                 items.append(it)
     return items
@@ -781,23 +893,77 @@ def run_once(cfg: dict, dry: bool = False, limit: int | None = None, force: bool
     global _CFG_REF
     _CFG_REF = cfg
     ensure_dirs(cfg)
-    be = make_backend(cfg)
-    where = be.root if be.kind == "local" else f"{cfg['root_name']} (drive)"
-    log(f"백엔드={be.kind} 루트={where}")
 
-    items = scan_inbox(be, cfg)
-    log(f"inbox 오디오 {len(items)}개")
-    if limit:
-        items = items[:limit]
-    done = 0
-    for it in items:
-        try:
-            if process_one(be, it, cfg, dry=dry, force=force):
-                done += 1
-        except Exception as e:
-            log(f"  ! 실패 {it['name']}: {e}")
-    log(f"완료 {done}건")
-    return done
+    # 데드맨 스위치: 마지막 성공이 너무 오래됐으면 한 번 알린다(6시간 간격)
+    st = read_status()
+    last_ok = st.get("last_success_at") or ""
+    warn_at = st.get("last_deadman_warn") or ""
+    try:
+        if last_ok:
+            age = time.time() - dt.datetime.fromisoformat(last_ok).timestamp()
+            warned = time.time() - dt.datetime.fromisoformat(warn_at).timestamp() if warn_at else 1e9
+            if age > DEADMAN_SEC and warned > 6 * 3600:
+                log(f"! 마지막 성공 후 {age/3600:.1f}시간 경과 — 확인이 필요합니다")
+                notify_mac(f"Hemory 전사가 {age/3600:.0f}시간째 성공하지 못했습니다", "Hemory 점검 필요")
+                write_status(last_deadman_warn=dt.datetime.now().astimezone().isoformat(timespec="seconds"))
+    except Exception:
+        pass
+
+    fd = acquire_lock()
+    if fd is None and not dry:
+        log("이미 실행 중인 파이프라인이 있어 건너뜁니다(락 파일)")
+        return 0
+    try:
+        be = make_backend(cfg)
+        where = be.root if be.kind == "local" else f"{cfg['root_name']} (drive)"
+        log(f"백엔드={be.kind} 루트={where}")
+
+        items = scan_inbox(be, cfg)
+        log(f"inbox 오디오 {len(items)}개")
+        if limit:
+            items = items[:limit]
+        done = 0
+        for it in items:
+            try:
+                if process_one(be, it, cfg, dry=dry, force=force):
+                    done += 1
+            except AuthError:
+                raise
+            except Exception as e:
+                log(f"  ! 실패 {it['name']}: {e}")
+        log(f"완료 {done}건")
+        if not dry:
+            write_status(
+                ok=True,
+                last_success_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                last_error="",
+                last_error_kind="",
+                processed=done,
+            )
+        return done
+    except AuthError as e:
+        log(f"! 인증 실패 — 전사 중단: {e}")
+        if not dry:
+            write_status(
+                ok=False,
+                last_error=str(e),
+                last_error_kind="auth",
+                last_failure_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+            notify_mac("Google 재인증이 필요해 전사가 멈췄습니다", "Hemory 인증 만료")
+        return 0
+    except Exception as e:
+        log(f"! 실행 실패: {e}")
+        if not dry:
+            write_status(
+                ok=False,
+                last_error=str(e),
+                last_error_kind="other",
+                last_failure_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+        raise
+    finally:
+        release_lock(fd)
 
 
 def main() -> None:

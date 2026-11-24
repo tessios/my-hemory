@@ -318,3 +318,59 @@ input{font:inherit;color:inherit}
 .spinner{width:16px;height:16px;border:2px solid rgba(255,255,255,.35);border-top-color:#fff;border-radius:50%;animation:spin .8s linear infinite;display:inline-block}
 .spinner.dark{border-color:rgba(0,0,0,.15);border-top-color:#111}
 .loading{padding:40px 20px;text-align:center;color:var(--muted);font-size:13px}
+
+/* ── v1.4: 선택 삭제 · 요약 미리보기 · 재생 상태 · 구간 표시 ─────────── */
+.head-actions{display:flex;align-items:center;gap:6px;flex:0 0 auto}
+.text-btn{padding:0 10px;height:38px;border-radius:19px;border:1px solid var(--line-2);background:#fff;font-size:12.5px;font-weight:600;color:var(--ink-2);letter-spacing:-.01em}
+.text-btn.on{background:#111;border-color:#111;color:#fff}
+.text-btn:active{transform:scale(.98)}
+.btn-danger{background:#111;color:#fff}
+.btn-danger:disabled{opacity:.35}
+
+.card.selectable{grid-template-columns:24px 52px 1fr}
+.card.selectable .ck{
+  width:22px;height:22px;border-radius:50%;border:1.5px solid var(--line-2);
+  display:grid;place-items:center;font-size:12px;line-height:1;color:#fff;align-self:center;background:#fff;
+}
+.card.on{border-color:#111;background:#fafafa}
+.card.on .ck{background:#111;border-color:#111}
+.tag.seg{background:#fff;border:1px solid var(--line-2);color:var(--muted);font-variant-numeric:tabular-nums}
+
+.del-bar{
+  position:fixed;left:50%;transform:translateX(-50%);width:calc(100% - 24px);max-width:456px;
+  bottom:calc(var(--sb) + 76px);z-index:72;display:flex;align-items:center;gap:8px;
+  padding:10px 12px;background:#111;color:#fff;border-radius:14px;box-shadow:0 10px 28px rgba(0,0,0,.22);
+}
+.del-bar[hidden]{display:none}
+.del-bar .db-n{flex:1;font-size:12.5px;font-weight:600}
+.db-btn{padding:7px 12px;border-radius:999px;background:rgba(255,255,255,.14);color:#fff;font-size:12px;font-weight:600;white-space:nowrap}
+.db-btn.danger{background:#fff;color:#111}
+.db-btn:disabled{opacity:.4}
+
+.del-list{border:1px solid var(--line);border-radius:12px;overflow:hidden}
+.del-row{display:flex;gap:10px;padding:9px 12px;font-size:12.5px;border-bottom:1px solid var(--line);line-height:1.4}
+.del-row:last-child{border-bottom:0}
+.del-row .dr-t{color:var(--muted);flex:0 0 auto;font-variant-numeric:tabular-nums}
+.del-row .dr-n{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.del-row.muted{color:var(--muted)}
+.link-danger{font-size:12.5px;color:var(--muted);text-decoration:underline;text-underline-offset:3px}
+
+.recovery{padding:6px 20px 0}
+.rec-card{display:flex;align-items:center;gap:10px;padding:11px 12px;border:1px solid var(--line-2);border-radius:14px;background:#fafafa}
+.rec-card .rc-main{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.rec-card .rc-main b{font-size:12.5px;letter-spacing:-.01em}
+.rec-card .rc-main span{font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rec-card .db-btn{background:#111;color:#fff}
+.rec-card .db-btn:last-child{background:var(--chip);color:var(--ink-2)}
+
+.pl-status{margin-top:8px;font-size:11.5px;color:var(--muted);text-align:center;line-height:1.4}
+.pl-status.loading{color:var(--muted)}
+.pl-status.error{color:#b91c1c}
+.pl-btn.busy{opacity:.55}
+
+.tr-head{
+  position:sticky;top:0;z-index:2;margin:12px 0 4px;padding:6px 2px 5px;
+  font-size:10.5px;letter-spacing:.08em;color:var(--muted);font-weight:600;
+  background:linear-gradient(#fff 70%,rgba(255,255,255,0));
+}
+.tr-head:first-child{margin-top:2px}

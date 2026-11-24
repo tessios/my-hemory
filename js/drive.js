@@ -17,6 +17,7 @@
      (녹음 중에 화면을 넘기면 녹음이 끊기기 때문) */
 import { CONFIG } from "./config.js";
 import { localSettings, saveSettings, sleep } from "./util.js";
+import { audioMimeFor } from "./pure.js";
 
 const TOKEN_KEY = "hemory.token";      // { access_token, expiresAt } — 1시간짜리 액세스 토큰
 const SESSION_KEY = "hemory.session";  // { email, name, since } — 로그인한 사람 (토큰 만료와 무관)
@@ -472,6 +473,34 @@ export const drive = {
     return `${CONFIG.driveApi}/files/${fileId}?alt=media&access_token=${encodeURIComponent(this.token || "")}`;
   },
 
+  /* 재생용 오디오 내려받기 (v1.4)
+     아이폰 Safari 는 <audio src> 에 Authorization 헤더를 붙일 수 없고,
+     쿼리 토큰 URL 은 만료·리디렉트에서 자주 깨진다. 토큰을 헤더로 붙여
+     Blob 으로 받고, MIME 을 확장자 기준으로 확실히 지정해 재생한다. */
+  async audioBlob(fileId, { name = "" } = {}) {
+    if (!fileId) throw new Error("오디오 파일이 없습니다");
+    const fetchOnce = async () => {
+      const token = await this.ensureToken();
+      return fetch(`${CONFIG.driveApi}/files/${fileId}?alt=media`, {
+        headers: { Authorization: "Bearer " + token },
+      });
+    };
+    let res = await fetchOnce();
+    if (res.status === 401) {
+      this.expiresAt = 0;
+      writeJSON(TOKEN_KEY, { access_token: this.token, expiresAt: 0 });
+      res = await fetchOnce();
+    }
+    if (!res.ok) {
+      let msg = `오디오를 내려받지 못했습니다 (${res.status})`;
+      if (res.status === 401 || res.status === 403) msg = "Google 연결이 만료되었습니다 · 다시 연결해 주세요";
+      if (res.status === 404) msg = "드라이브에서 오디오 파일을 찾지 못했습니다";
+      throw new Error(msg);
+    }
+    const buf = await res.arrayBuffer();
+    return new Blob([buf], { type: audioMimeFor(name, res.headers.get("content-type") || "") });
+  },
+
   /* ── 업로드(재개형, 진행률) ─────────────────── */
   async upload(blob, name, parentId, { mimeType, onProgress } = {}) {
     const token = await this.ensureToken();
@@ -489,19 +518,14 @@ export const drive = {
     if (!init.ok) throw new Error("업로드 시작 실패 (" + init.status + ")");
     const loc = init.headers.get("Location");
     if (!loc) throw new Error("업로드 주소를 받지 못했습니다.");
-    return new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("PUT", loc);
-      xhr.setRequestHeader("Content-Type", mimeType || blob.type || "application/octet-stream");
-      xhr.upload.onprogress = (e) => { if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total); };
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try { resolve(JSON.parse(xhr.responseText)); } catch { resolve({}); }
-        } else reject(new Error("업로드 실패 (" + xhr.status + ")"));
-      };
-      xhr.onerror = () => reject(new Error("네트워크 오류로 업로드하지 못했습니다."));
-      xhr.send(blob);
+    // 세션 URI 로 본문 전송 — XHR 대신 fetch(모바일 사파리에서 안정적)
+    const res = await fetch(loc, {
+      method: "PUT",
+      headers: { "Content-Type": mimeType || blob.type || "application/octet-stream" },
+      body: blob,
     });
+    if (!res.ok) throw new Error("업로드 실패 (" + res.status + ")");
+    try { return await res.json(); } catch { return {}; }
   },
 
   async trash(fileId) {
@@ -510,5 +534,15 @@ export const drive = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ trashed: true }),
     });
+  },
+
+  /* 여러 파일을 한꺼번에 휴지통으로 (하나가 실패해도 나머지는 계속) */
+  async trashMany(fileIds = []) {
+    const out = { ok: [], failed: [] };
+    for (const id of fileIds.filter(Boolean)) {
+      try { await this.trash(id); out.ok.push(id); }
+      catch (e) { out.failed.push({ id, error: e?.message || String(e) }); }
+    }
+    return out;
   },
 };

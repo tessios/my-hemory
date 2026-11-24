@@ -62,6 +62,15 @@ export class Recorder {
     this._lastTick = 0;
     this._vadTimer = null;
 
+    /* v1.4: 신호 감시 · 세그먼트(30분) 교체 · 청크 적립 */
+    this.recStream = null;     // MediaRecorder 에 물린 스트림(회전 시 재사용)
+    this.maxRms = 0;           // 이 구간에서 측정된 최대 레벨
+    this.noSignalMs = 0;       // 완전 무신호가 이어진 시간
+    this._sigAlerted = false;  // 무신호 경고를 이미 띄웠는가
+    this._levelTimer = null;
+    this.onPart = null;        // (chunk, index) => void  — 로컬 적립용
+    this.onSignalAlert = null; // ({ ms, track }) => void — 마이크 신호 끊김 알림
+
     /* 상태 알림: { wake, vad, speaking, speechSec, state } */
     this.onStatus = null;
   }
@@ -186,6 +195,67 @@ export class Recorder {
     if (before !== this.speaking) this._notify();
   }
 
+  /* ── 신호 감시 ────────────────────────────────────────────
+     VAD 와 별개로 항상 레벨을 재서 (a) 최대 레벨 (b) 완전 무신호 지속 시간을 본다.
+     마이크가 실제로 죽으면(화면 잠금·백그라운드 전환 등) RMS 가 0 근처에 머문다. */
+  _peakRms() {
+    const a = this.analyser;
+    if (!a) return 0;
+    const buf = new Uint8Array(a.fftSize);
+    a.getByteTimeDomainData(buf);
+    let sum = 0, peak = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const v = Math.abs((buf[i] - 128) / 128);
+      if (v > peak) peak = v;
+      sum += v * v;
+    }
+    return Math.max(Math.sqrt(sum / buf.length), peak * 0.6);
+  }
+
+  _trackHealth() {
+    const t = this.stream?.getAudioTracks?.()[0];
+    if (!t) return null;
+    return { readyState: t.readyState, muted: !!t.muted, enabled: !!t.enabled, label: t.label || "" };
+  }
+
+  /* 전화·Siri·화면 잠금으로 iOS 가 오디오 세션을 끊으면 트랙에 mute/ended 가 온다. */
+  _bindTrackWatch() {
+    const t = this.stream?.getAudioTracks?.()[0];
+    if (!t) return;
+    this._onTrackMute = () => { try { this.onSignalAlert?.({ ms: 0, track: this._trackHealth() }); } catch {} };
+    this._onTrackEnd = () => { try { this.onSignalAlert?.({ ms: 0, track: this._trackHealth() }); } catch {} };
+    try {
+      t.addEventListener("mute", this._onTrackMute);
+      t.addEventListener("ended", this._onTrackEnd);
+    } catch {}
+  }
+
+  _unbindTrackWatch() {
+    const t = this.stream?.getAudioTracks?.()[0];
+    if (!t) return;
+    try { t.removeEventListener("mute", this._onTrackMute); } catch {}
+    try { t.removeEventListener("ended", this._onTrackEnd); } catch {}
+  }
+
+  _startLevelLoop() {
+    clearInterval(this._levelTimer);
+    this._levelTimer = setInterval(() => this._levelTick(), 200);
+  }
+
+  _levelTick() {
+    if (this.state !== "recording") return;
+    const rms = this._peakRms();
+    this.maxRms = Math.max(this.maxRms, rms);
+    if (rms <= 0.0022) this.noSignalMs += 200;
+    else this.noSignalMs = 0;
+    if (this.noSignalMs >= 3000 && !this._sigAlerted) {
+      this._sigAlerted = true;
+      // 마이크가 조용한 게 아니라 죽은 경우엔 VAD 게이트를 열어 두는 편이 낫다(원음 보존).
+      try { this._setGate(true); } catch {}
+      try { this.onSignalAlert?.({ ms: this.noSignalMs, track: this._trackHealth() }); } catch {}
+    }
+  }
+
   /* ── 녹음 ───────────────────────────────────────────────── */
   async start({ vad = false } = {}) {
     if (!Recorder.supported) throw new Error("이 브라우저에서는 녹음을 지원하지 않습니다.");
@@ -206,32 +276,42 @@ export class Recorder {
     this.analyser.smoothingTimeConstant = 0.2;
     src.connect(this.analyser);
 
-    // VAD 를 켜면 게인 게이트를 거친 스트림을, 끄면 원본 스트림을 그대로 녹음
-    // (오디오 컨텍스트가 잠들어 있으면 레벨을 잴 수 없으므로 VAD 를 끄고 원본을 녹음한다)
-    this.vad = !!vad && Recorder.vadSupported && this.ctx.state === "running";
-    let recStream = this.stream;
+    // v1.4: 녹음은 **마이크 원본 스트림**을 그대로 담는다.
+    //   예전에는 VAD 게이트(src→gain→MediaStreamDestination)를 거친 스트림을 녹음했는데,
+    //   사용자 동작 없이(엎어서) 시작하면 iOS 가 AudioContext 를 suspended 로 두어
+    //   destination 스트림이 **무음을 출력**했고, 그게 그대로 저장됐다(18초/6.3kbps 사고).
+    //   이제 VAD 는 녹음 경로에 끼지 않고 '말한 구간(speechSec)'만 세는 참고 정보다.
+    //   침묵 제거는 전사 단계(whisper VAD)에서 한다.
+    this.vad = !!vad && Recorder.vadSupported;
+    const recStream = this.stream;
     this.speaking = false;
     this.speechSec = 0;
     this._open = true;
     this._silentMs = 0;
     this._noise = 0.006;
-    if (this.vad) {
-      this.gate = this.ctx.createGain();
-      this.gate.gain.value = 1;
-      this.dest = this.ctx.createMediaStreamDestination();
-      src.connect(this.gate);
-      this.gate.connect(this.dest);
-      recStream = this.dest.stream;
-    }
 
+    this.recStream = recStream;
     this.rec = new MediaRecorder(recStream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
     this.chunks = [];
-    this.rec.ondataavailable = (e) => { if (e.data && e.data.size) this.chunks.push(e.data); };
+    this.rec.ondataavailable = (e) => {
+      if (e.data && e.data.size) {
+        this.chunks.push(e.data);
+        try { this.onPart?.(e.data, this.chunks.length); } catch {}
+      }
+    };
     this.rec.start(1000);
 
     this.startedAt = Date.now();
     this.elapsed = 0;
+    this.maxRms = 0;
+    this.noSignalMs = 0;
+    this._sigAlerted = false;
     this.state = "recording";
+
+    // iOS 웹앱: 오디오 세션을 '재생+녹음'으로 명시해 두면 화면 전환 시 입력이 덜 끊긴다.
+    try { if (navigator.audioSession) navigator.audioSession.type = "play-and-record"; } catch {}
+    this._startLevelLoop();
+    this._bindTrackWatch();
 
     await this._acquireWakeLock();
     this._onVis = () => {
@@ -285,6 +365,10 @@ export class Recorder {
   _teardown() {
     clearInterval(this._vadTimer);
     this._vadTimer = null;
+    this._unbindTrackWatch();
+    clearInterval(this._levelTimer);
+    this._levelTimer = null;
+    try { if (navigator.audioSession) navigator.audioSession.type = "auto"; } catch {}
     if (this._onVis) { document.removeEventListener("visibilitychange", this._onVis); this._onVis = null; }
     this._releaseWakeLock();
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
@@ -293,7 +377,46 @@ export class Recorder {
     try { this.dest?.disconnect?.(); } catch {}
     // 공유 컨텍스트는 닫지 않는다(다음 녹음에서 다시 쓰려고 깨워 둔 것)
     if (this._ownCtx) { try { this.ctx?.close(); } catch {} }
-    this.rec = null; this.stream = null; this.analyser = null; this.ctx = null; this.gate = null; this.dest = null; this.src = null;
+    this.rec = null; this.stream = null; this.analyser = null; this.ctx = null; this.gate = null; this.dest = null; this.src = null; this.recStream = null;
+  }
+
+  /* 30분 세그먼트 교체 — 스트림·게이트·워크락은 그대로 두고 MediaRecorder 만 새로 만든다.
+     (새 스트림을 열면 사용자 제스처 없이는 막히므로 절대 닫지 않는다) */
+  async rotate() {
+    if (!this.rec || this.state !== "recording" || !this.recStream) return null;
+    const duration = (Date.now() - this.startedAt) / 1000;
+    this.elapsed += duration;
+    const speech = this.vad ? Math.min(this.speechSec, duration) : null;
+    const maxRms = this.maxRms;
+    const silentAlerted = this._sigAlerted;
+    const prev = this.rec;
+    const prevChunks = this.chunks;
+    await new Promise((resolve) => {
+      prev.onstop = () => resolve();
+      try { if (prev.state !== "inactive") prev.stop(); else resolve(); } catch { resolve(); }
+    });
+    const type = this.mime || "audio/mp4";
+    const blob = new Blob(prevChunks, { type });
+
+    this.chunks = [];
+    this.speechSec = 0;
+    this.maxRms = 0;
+    this.noSignalMs = 0;
+    this._sigAlerted = false;
+    this.elapsed = 0;
+    this.rec = new MediaRecorder(this.recStream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
+    this.rec.ondataavailable = (e) => {
+      if (e.data && e.data.size) {
+        this.chunks.push(e.data);
+        try { this.onPart?.(e.data, this.chunks.length); } catch {}
+      }
+    };
+    this.rec.start(1000);
+    this.startedAt = Date.now();
+    this.state = "recording";
+    if (this.vad) { this._lastTick = Date.now(); this._setGate(true); }
+    this._notify();
+    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, maxRms, silentAlerted };
   }
 
   async stop() {
@@ -309,13 +432,17 @@ export class Recorder {
     });
     const type = this.mime || "audio/mp4";
     const blob = new Blob(this.chunks, { type });
+    const maxRms = this.maxRms;
+    const silentAlerted = this._sigAlerted;
     this.state = "done";
     this._teardown();
     this._notify();
-    return { blob, duration, mime: type, vad: this.vad, speechSec: speech };
+    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, maxRms, silentAlerted };
   }
 
   cancel() {
+    clearInterval(this._levelTimer);
+    this._levelTimer = null;
     if (this.rec) { try { this.rec.onstop = null; this.rec.stop(); } catch {} }
     this._teardown();
     this.state = "idle";

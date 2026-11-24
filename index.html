@@ -42,13 +42,17 @@
           <div class="brand">HEMORY</div>
           <h1 class="head-title" id="tl-month">기록</h1>
         </div>
-        <button class="icon-btn" id="btn-sync" title="동기화" aria-label="동기화">
-          <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 10a8 8 0 0 1 13.7-4.3L20 8M20 4v4h-4M20 14a8 8 0 0 1-13.7 4.3L4 16M4 20v-4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
+        <div class="head-actions">
+          <button class="text-btn" id="btn-select">선택</button>
+          <button class="icon-btn" id="btn-sync" title="동기화" aria-label="동기화">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 10a8 8 0 0 1 13.7-4.3L20 8M20 4v4h-4M20 14a8 8 0 0 1-13.7 4.3L4 16M4 20v-4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
       </div>
       <div class="head-sub" id="tl-sub">불러오는 중…</div>
     </header>
     <div class="chips" id="tl-chips"></div>
+    <div id="recovery" class="recovery" hidden></div>
     <div id="tl-tip"></div>
     <div id="tl-list" class="list"></div>
   </section>
@@ -107,6 +111,7 @@
 </div>
 
 <div id="sheet-root"></div>
+<div id="del-bar" class="del-bar" hidden></div>
 <div id="auto-bar" class="auto-bar" hidden></div>
 <button id="flip-chip" class="flip-chip" hidden></button>
 <div id="sleep-overlay" hidden><div class="so-body"><span class="so-dot"></span><span class="so-txt">녹음 중</span><span class="so-time" id="so-time">00:00</span></div><div class="so-hint">들면 자동으로 저장합니다</div></div>

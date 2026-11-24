@@ -24,7 +24,7 @@ import urllib.parse
 from pathlib import Path
 
 from hemory_pipeline import (
-    AUDIO_EXT, CONFIG_PATH, STATE_DIR, DriveBackend, LocalBackend, ensure_dirs,
+    AUDIO_EXT, CONFIG_PATH, STATE_DIR, AuthError, DriveBackend, LocalBackend, ensure_dirs,
     iso_local, load_config, log, make_backend, now_local,
 )
 
@@ -131,8 +131,12 @@ def main() -> None:
     ensure_dirs(cfg)
     be = make_backend(cfg)
     log(f"정리 시작 · 백엔드={be.kind} · 보관 {days}일 · dry_run={args.dry_run}")
-    res = prune_local(be, cfg, days, args.dry_run, purge_days) if be.kind == "local" \
-        else prune_drive(be, cfg, days, args.dry_run, purge_days)
+    try:
+        res = prune_local(be, cfg, days, args.dry_run, purge_days) if be.kind == "local" \
+            else prune_drive(be, cfg, days, args.dry_run, purge_days)
+    except AuthError as e:
+        log(f"! 인증 실패 — 정리 건너뜀: {e}")
+        return
 
     for m in res["moved"]:
         log(f"  {'[dry] ' if args.dry_run else ''}이동: {m['file']} ({m['age_days']}일)")

@@ -57,6 +57,7 @@ export class FlipWatcher {
     this.permDetail = {};
     this.askedThisLoad = false;
 
+    this.listenAt = 0;
     this.last = { beta: null, gz: null, t: 0 };
     this.zUp = -1;              // 화면이 위일 때의 z 부호(아이폰 -1)
     this.pose = "none";
@@ -165,6 +166,7 @@ export class FlipWatcher {
   start() {
     if (this.listening || !this.supported) { this._sync(); return; }
     this.listening = true;
+    this.listenAt = Date.now();
     window.addEventListener("devicemotion", this._onMotion, true);
     window.addEventListener("deviceorientation", this._onOrient, true);
     clearInterval(this._timer);
@@ -282,7 +284,8 @@ export class FlipWatcher {
     else if (!this.armed && !this.probe) s = "off";
     else if (!this.listening) s = "need-tap";
     else if (this.perm === "unknown") s = "need-tap";
-    else if (this.perm === "not-required" && !this.hasSignal) s = "nosignal";
+    // 허용받았는데도 이벤트가 안 들어오는 경우(워치독) — 저전력 모드·설정 토글 등
+    else if (!this.hasSignal && Date.now() - (this.listenAt || 0) > 2600) s = "nosignal";
     else s = "ready";
     if (s !== this.state) {
       this.state = s;

@@ -7,6 +7,9 @@ import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./q
 import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio } from "./record.js";
 import { FlipWatcher } from "./flip.js";
 import {
+  previewLine, segmentRangeLabel, segmentDue, groupTranscript, silentVerdict, recordSegmentLabel, SEGMENT_SEC,
+} from "./pure.js";
+import {
   $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, fmtMonth, dayKey, relDay,
   toast, haptic, debounce, uid, stamp, localSettings, saveSettings, sleep,
 } from "./util.js";
@@ -26,6 +29,9 @@ const S = {
   recordingSheet: null,
   sheet: null,
   auto: { on: false, pending: false, failAt: 0, startedAt: 0, type: "work", timer: null, gestureBound: false },
+  sel: { on: false, ids: new Set() },          // 타임라인 선택 모드
+  seg: { index: 0, startAt: 0, timer: null, type: "work" },  // 30분 세그먼트
+  segSession: null,                            // 로컬 적립 중인 녹음 세션 메타
 };
 
 /* ── 예약 녹음(요일·시간) ─────────────────────────────── */
@@ -117,24 +123,38 @@ function setFaceDown(on, { prewarm = false } = {}) {
   return flip.state;
 }
 
-/* 앱을 새로 열면 iOS 센서 권한은 다시 한 번 필요하다 → 첫 탭에서 조용히 요청 */
+/* 앱을 새로 열면 iOS 센서 권한은 다시 한 번 필요하다 → 첫 터치에서 조용히 요청
+   iOS 가 '사용자 동작'으로 인정하는 이벤트는 pointerup·touchend·click·keydown 이다
+   (pointerdown·touchstart 는 인정되지 않아 권한 요청이 거부될 수 있다).
+   성공하기 전에는 리스너를 지우지 않고, 성공하면 정리한다. */
 function armFlipPermission() {
-  if (S.facePermissionArmed) return;
-  S.facePermissionArmed = true;
-  const once = async (e) => {
-    document.removeEventListener("pointerdown", once, true);
-    document.removeEventListener("keydown", once, true);
-    S.facePermissionArmed = false;
-    if (!faceDownPref() || flip.granted || flip.askedThisLoad) return;
-    // 스위치·권한 버튼을 직접 누른 경우는 그쪽 핸들러가 처리한다
-    const t = e?.target;
-    if (t?.closest?.("#s-flip-on, #s-flip-perm, #rec-face, #s-flip-test")) return;
-    const r = await flip.requestPermission();
-    if (r.ok) { flip.start(); toast("뒤집어 녹음 준비됨 · 폰을 엎어 보세요", 1800); }
-    else renderFlipChip();
+  if (S.faceArm) return;
+  S.faceArm = true;
+  let busy = false;
+  const events = ["pointerup", "touchend", "click", "keydown"];
+  const detach = () => {
+    S.faceArm = false;
+    events.forEach((t) => document.removeEventListener(t, once, true));
   };
-  document.addEventListener("pointerdown", once, true);
-  document.addEventListener("keydown", once, true);
+  const once = async (e) => {
+    if (busy) return;
+    if (!faceDownPref() || flip.granted) return detach();
+    if (flip.perm === "denied") return detach();
+    const t = e?.target;
+    if (t?.closest?.("#s-flip-on, #s-flip-perm, #rec-face, #s-flip-test, #flip-chip")) return;
+    busy = true;
+    const r = await flip.requestPermission();
+    busy = false;
+    if (r.ok) {
+      flip.start();
+      detach();
+      toast("뒤집어 녹음 준비됨 · 폰을 엎어 보세요", 1800);
+    } else {
+      renderFlipChip();
+      if (r.reason === "denied") detach();
+    }
+  };
+  events.forEach((t) => document.addEventListener(t, once, true));
 }
 
 async function startFaceRecording() {
@@ -156,6 +176,8 @@ async function startFaceRecording() {
   S.face.active = true;
   S.face.startedAt = Date.now();
   S.face.pending = false;
+  beginLocalSession({ title: `뒤집어 녹음 ${fmtTime(new Date().toISOString())}`, type: "work" });
+  startSegTimer("work", S.face.startedAt);
   if (!flip.active) flip.adopt();     // 탭으로 시작한 경우에도 들면 자동 저장되도록
   haptic(16);
   showSleepOverlay();
@@ -172,6 +194,117 @@ function recorderIdle() {
   return R.state === "idle";
 }
 
+/* ── 재생용 오디오 캐시 (같은 파일을 두 번 받지 않게) ── */
+const audioCache = new Map();   // fileId → Blob
+const audioCacheMax = 12;
+function rememberAudio(fileId, blob) {
+  if (!fileId || !blob) return;
+  if (audioCache.size >= audioCacheMax) {
+    const first = audioCache.keys().next().value;
+    if (first) audioCache.delete(first);
+  }
+  audioCache.set(fileId, blob);
+}
+
+/* ── 녹음 중 로컬 적립(IndexedDB) ────────────────────────────
+   어떤 경우에도 기기에 먼저 남긴다. 앱이 강제 종료되거나 업로드가 실패해도
+   다음 실행에서 '복구' 배너로 되살릴 수 있다. */
+function beginLocalSession({ title, type }) {
+  S.segSession = { id: "s" + Date.now().toString(36), startedAt: Date.now(), title, type };
+  store.sessionSet({ ...S.segSession }).catch(() => {});
+}
+function endLocalSession() {
+  const id = S.segSession?.id;
+  S.segSession = null;
+  if (id) store.partClearGroup(id).catch(() => {});
+  store.sessionDel().catch(() => {});
+}
+function wireRecorder() {
+  S.recorder.onPart = (chunk, index) => {
+    if (!S.segSession) return;
+    store.partPut(`${S.segSession.id}:${String(index).padStart(5, "0")}`, chunk).catch(() => {});
+  };
+  S.recorder.onSignalAlert = ({ ms, track }) => {
+    if (S.recorder.state !== "recording") return;
+    const dead = !track || track.readyState !== "live" || track.muted || !track.enabled;
+    toast(dead
+      ? "마이크 입력이 끊겼습니다 · 폰을 들었다 다시 엎으면 새로 녹음합니다"
+      : "마이크 소리가 들어오지 않습니다 · 마이크 구멍이 막혔는지 확인하세요", 4200);
+    const hint = $(".so-hint");
+    if (hint) hint.textContent = "마이크 신호 없음 · 들었다 다시 엎어 주세요";
+    haptic([12, 60, 12]);
+    console.warn("mic signal lost", ms, track);
+  };
+}
+
+/* ── 30분 세그먼트 ─────────────────────────────────────────
+   녹음을 끊지 않고(같은 스트림·게이트) MediaRecorder 만 교체해
+   30분 블록으로 타임라인에 쌓는다. */
+function startSegTimer(type, startedAt = Date.now()) {
+  clearInterval(S.seg.timer);
+  S.seg.index = 0;
+  S.seg.startAt = startedAt;
+  S.seg.type = type || "work";
+  S.seg.timer = setInterval(() => { segTick().catch(() => {}); }, 1000);
+}
+function stopSegTimer() {
+  clearInterval(S.seg.timer);
+  S.seg.timer = null;
+}
+/* 30분 제한 — 테스트에서만 localStorage(hemory.segTest)로 줄여 검증한다 */
+function segLimitSec() {
+  try {
+    const v = Number(localStorage.getItem("hemory.segTest"));
+    if (v >= 2 && v <= 3600) return v;
+  } catch {}
+  return SEGMENT_SEC;
+}
+async function segTick() {
+  if (S.recorder.state !== "recording") return;
+  if (!segmentDue(S.seg.startAt, Date.now(), segLimitSec())) return;
+  await segRotate();
+}
+async function segRotate() {
+  const index = S.seg.index;
+  const startAt = S.seg.startAt;
+  const out = await S.recorder.rotate();
+  if (!out || !out.blob?.size) return;
+  const endAt = Date.now();
+  S.seg.index = index + 1;
+  S.seg.startAt = endAt;
+  const label = segmentRangeLabel(startAt, endAt);
+  const verdict = silentVerdict({ maxRms: out.maxRms, durationSec: out.duration, speechSec: out.speechSec, vad: out.vad });
+  const title = `${label} 녹음${verdict.silent ? " · 무음" : ""}`;
+  try {
+    await saveRecordingFast({
+      blob: out.blob, duration: out.duration, mime: out.mime, title,
+      type: S.seg.type, speechSec: out.speechSec,
+      started_at: new Date(startAt).toISOString(),
+      segment: { index, start: new Date(startAt).toISOString(), end: new Date(endAt).toISOString(), label },
+    });
+    toast(`${label} 구간을 저장했습니다`);
+  } catch (e) {
+    toast("구간을 기기에 보관했습니다 · 연결되면 올라갑니다", 3200);
+  }
+  if (verdict.silent) toast("이 구간은 소리가 거의 없었습니다 (마이크 확인)", 3200);
+}
+
+/* 녹음 결과에 무음 판정을 붙여 저장 */
+async function saveRecordedOut(out, { title, type, startedAt, segment } = {}) {
+  const verdict = silentVerdict({ maxRms: out.maxRms, durationSec: out.duration, speechSec: out.speechSec, vad: out.vad });
+  const finalTitle = verdict.silent ? `${title} · 무음` : title;
+  await saveRecordingFast({
+    blob: out.blob, duration: out.duration, mime: out.mime, title: finalTitle,
+    type, speechSec: out.speechSec, started_at: startedAt, segment,
+  });
+  if (verdict.silent) {
+    toast(verdict.reason === "no_signal"
+      ? "저장했지만 마이크 소리가 없었습니다 · 마이크를 확인해 주세요"
+      : "저장했지만 말소리가 거의 없었습니다", 4200);
+  }
+  return verdict;
+}
+
 async function stopFaceRecording(save = true) {
   const was = S.face.active || S.face.pending;
   if (!was) return;
@@ -182,15 +315,28 @@ async function stopFaceRecording(save = true) {
   hideSleepOverlay();
   flip.markStopped();
   renderFlipChip();
+  stopSegTimer();
   if (S.recorder.state === "idle") return;
+  const segIndex = S.seg.index;
+  const segStart = S.seg.startAt || S.face.startedAt;
   const out = await S.recorder.stop();
-  if (!save || !out || !out.blob?.size) return;
-  const title = `뒤집어 녹음 ${fmtTime(new Date().toISOString())}`;
+  if (!save || !out || !out.blob?.size) { endLocalSession(); return; }
+  const endAt = Date.now();
+  const label = segmentRangeLabel(segStart, endAt);
+  const title = segIndex === 0
+    ? `뒤집어 녹음 ${fmtTime(new Date(segStart).toISOString())}`
+    : `${label} 녹음`;
   try {
-    await saveRecordingFast({ blob: out.blob, duration: out.duration, mime: out.mime, title, type: "work", speechSec: out.speechSec });
+    await saveRecordedOut(out, {
+      title, type: "work",
+      startedAt: new Date(segStart).toISOString(),
+      segment: { index: segIndex, start: new Date(segStart).toISOString(), end: new Date(endAt).toISOString(), label },
+    });
+    endLocalSession();
     haptic([10, 40, 10]);
     toast("녹음을 저장했습니다");
   } catch (e) {
+    // 기기(IndexedDB)에는 이미 남아 있다 — 다음 실행에서 복구할 수 있다
     toast("기기에 보관했습니다 · 연결되면 올라갑니다");
   }
 }
@@ -233,8 +379,11 @@ function renderFlipChip() {
   el.hidden = !show;
   if (!show) return;
   el.dataset.state = flip.state;
+  const label = flip.state === "need-tap" ? "탭해서 센서 연결"
+    : flip.state === "nosignal" ? "센서 신호 없음 · 탭해서 다시 연결"
+    : flip.label;
   const t = flip.state === "active" ? ` · ${fmtClock(flip.elapsedSec)}` : "";
-  el.innerHTML = `<span class="fc-dot"></span><span>뒤집어 녹음 · ${esc(flip.label)}${t}</span>`;
+  el.innerHTML = `<span class="fc-dot"></span><span>뒤집어 녹음 · ${esc(label)}${t}</span>`;
 }
 
 /* 설정 화면의 실시간 센서 표시 */
@@ -272,12 +421,16 @@ function paintFlipReadout(force = false) {
 /* ────────────────────────────────── 시작 ── */
 async function boot() {
   drive.init();
+  // iOS 가 저장소를 임의로 비우지 않게(청크 복구 데이터 보호)
+  try { navigator.storage?.persist?.().catch(() => {}); } catch {}
   $("#app-version").textContent = CONFIG.version;
 
   let redirect = { ok: false };
   try { redirect = drive.consumeRedirect() || { ok: false }; } catch {}
 
   bindGlobal();
+  // 첫 실행: 권한이 이미 있으면 조용히 한 번 시도해 본다(성공하면 무터치로 준비)
+  setTimeout(() => { if (faceDownPref() && !flip.granted && S.mode === "live") armFlipPermission(); }, 1200);
 
   const notice = (() => { try { return localStorage.getItem("hemory.authNotice") || ""; } catch { return ""; } })();
   if (notice) {
@@ -345,6 +498,7 @@ async function reconnect() {
 
 function bindGlobal() {
   drive.canNavigate = canLeaveApp;
+  wireRecorder();
   $("#conn-bar")?.addEventListener("click", reconnect);
   $("#btn-signin").addEventListener("click", async () => {
     if (!drive.configured) return openSetupSheet();
@@ -365,6 +519,7 @@ function bindGlobal() {
 
   $$("#tabbar button").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
   $("#btn-sync").addEventListener("click", () => syncNow({ manual: true }));
+  $("#btn-select")?.addEventListener("click", () => setSelectMode(!S.sel.on));
   $("#fab").addEventListener("click", openRecorder);
 
   // 검색
@@ -415,11 +570,23 @@ function bindGlobal() {
     else {
       schedTick(); renderAutoBar(); resumeConnection();
       // 앱으로 돌아오면 센서 감시를 다시 건다(백그라운드에서 브라우저가 리스너를 쉬게 한다)
-      if (faceDownPref() && flip.granted && !flip.listening) flip.start();
+      if (faceDownPref()) {
+        if (!flip.granted) armFlipPermission();
+        else if (!flip.listening) flip.start();
+      }
       renderFlipChip();
     }
   });
   window.addEventListener("pagehide", () => { rescueRecording("pagehide"); });
+  window.addEventListener("pageshow", (e) => {
+    // bfcache 로 돌아온 경우: 센서·마이크 연결을 다시 확인한다
+    if (!e.persisted) return;
+    if (faceDownPref()) {
+      if (!flip.granted) armFlipPermission();
+      else if (!flip.listening) flip.start();
+    }
+    renderFlipChip();
+  });
 
   /* 절전 오버레이를 탭하면 바로 종료·저장(시작이 막혀 있으면 시작) */
   $("#sleep-overlay")?.addEventListener("click", () => {
@@ -431,8 +598,18 @@ function bindGlobal() {
     }
   });
 
-  /* 타임라인의 상태 칩 → 설정의 뒤집어 녹음 항목 */
-  $("#flip-chip")?.addEventListener("click", () => {
+  /* 타임라인의 상태 칩 → 권한이 없으면 바로 재연결(이 탭이 사용자 제스처다), 있으면 설정으로 */
+  $("#flip-chip")?.addEventListener("click", async () => {
+    if (S.mode !== "live") return;
+    if (!faceDownPref()) { setTab("settings"); return; }
+    if (!flip.granted) {
+      const r = await flip.requestPermission();
+      if (r.ok) { flip.start(); toast("센서를 다시 연결했습니다 · 폰을 엎어 보세요", 2000); }
+      else toast(r.reason === "denied" ? "센서 권한이 차단되어 있습니다 · 설정에서 허용해 주세요" : "센서 권한을 확인하지 못했습니다", 3200);
+      renderFlipChip();
+      return;
+    }
+    if (!flip.listening) { flip.start(); renderFlipChip(); toast("센서 감시를 다시 켰습니다", 1600); return; }
     setTab("settings");
     setTimeout(() => $("#sgroup-flip")?.scrollIntoView({ block: "center", behavior: "smooth" }), 60);
   });
@@ -508,6 +685,7 @@ async function enterLive() {
   }
   setTab("timeline");
   applyDeepLink();
+  checkLocalRecovery().catch(() => {});
   syncNow();
 }
 
@@ -660,6 +838,7 @@ function normalizeRecord(data, fileMeta, audioMeta) {
     language: data.language || "ko",
     fileId: fileMeta.id,
     modifiedTime: fileMeta.modifiedTime,
+    segment: data.segment || null,
     audioId: audioMeta?.id || data.audio?.file_id || null,
     audioName: audioMeta?.name || data.audio?.file_name || null,
     webViewLink: fileMeta.webViewLink || null,
@@ -731,6 +910,93 @@ function typeChips(counts) {
   return items.map((it) => `<button class="chip ${S.filter === it.k ? "on" : ""}" data-f="${it.k}">${it.label} <span style="opacity:.5">${it.n}</span></button>`).join("");
 }
 
+function filteredRecords() {
+  return S.filter === "all" ? S.records : S.records.filter((r) => r.type === S.filter);
+}
+
+function setSelectMode(on) {
+  S.sel.on = !!on;
+  S.sel.ids.clear();
+  const b = $("#btn-select");
+  if (b) { b.classList.toggle("on", S.sel.on); b.textContent = S.sel.on ? "완료" : "선택"; }
+  renderTimeline();
+}
+
+function toggleSel(id) {
+  if (S.sel.ids.has(id)) S.sel.ids.delete(id);
+  else S.sel.ids.add(id);
+  renderTimeline();
+}
+
+function renderSelBar() {
+  const bar = $("#del-bar");
+  if (!bar) return;
+  if (!S.sel.on) { bar.hidden = true; bar.innerHTML = ""; return; }
+  const n = S.sel.ids.size;
+  bar.hidden = false;
+  bar.innerHTML = `<span class="db-n">${n}개 선택</span>
+    <button class="db-btn" id="db-all">전체 선택</button>
+    <button class="db-btn danger" id="db-del" ${n ? "" : "disabled"}>삭제</button>`;
+  $("#db-all", bar).addEventListener("click", () => {
+    const all = filteredRecords();
+    S.sel.ids = new Set(S.sel.ids.size === all.length ? [] : all.map((r) => r.id));
+    renderTimeline();
+  });
+  $("#db-del", bar).addEventListener("click", () => {
+    confirmDeleteRecords(S.records.filter((r) => S.sel.ids.has(r.id)));
+  });
+}
+
+/* 삭제 — 드라이브는 휴지통으로(30일 복원 가능), 기기 캐시·인덱스는 즉시 제거 */
+function confirmDeleteRecords(recs) {
+  const list = (recs || []).filter(Boolean);
+  if (!list.length) return;
+  const n = list.length;
+  const rows = list.slice(0, 6).map((r) => `<div class="del-row"><span class="dr-t">${esc(fmtDay(r.started_at))} ${esc(fmtTime(r.started_at))}</span><span class="dr-n">${esc(r.title || "")}</span></div>`).join("");
+  const sheet = openSheet({
+    title: n === 1 ? "이 녹음을 삭제할까요?" : `${n}개 녹음을 삭제할까요?`,
+    sub: "드라이브 휴지통으로 이동합니다 · 30일 안에 복원할 수 있습니다",
+    body: `<div class="del-list">${rows}${n > 6 ? `<div class="del-row muted"><span>외 ${n - 6}개</span></div>` : ""}</div>
+      <p class="note" style="margin-top:12px">이 기기의 캐시와 검색 인덱스에서도 바로 사라집니다.</p>`,
+    foot: `<div style="display:flex;gap:8px"><button class="btn btn-ghost btn-block" id="del-cancel">취소</button><button class="btn btn-danger btn-block" id="del-ok">삭제</button></div>`,
+  });
+  $("#del-cancel", sheet).addEventListener("click", () => closeSheet());
+  $("#del-ok", sheet).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span>';
+    await deleteRecords(list);
+  });
+}
+
+async function deleteRecords(list) {
+  const done = new Set();
+  let failed = 0;
+  for (const r of list) {
+    const fileIds = [r.fileId, r.audioId].filter(Boolean);
+    let ok = true;
+    if (fileIds.length) {
+      const res = await drive.trashMany(fileIds);
+      failed += res.failed.length;
+      ok = res.failed.length === 0;
+    }
+    if (!ok) continue;
+    done.add(r.id);
+    try { await store.deleteRecords([r.id]); } catch {}
+    if (r.base) store.pendingDelBase(r.base).catch(() => {});
+  }
+  if (done.size) {
+    S.records = S.records.filter((r) => !done.has(r.id));
+    S.sel.ids = new Set([...S.sel.ids].filter((id) => !done.has(id)));
+    reindex();
+  }
+  closeSheet();
+  if (S.sel.on && !S.sel.ids.size) setSelectMode(false);
+  else renderTimeline();
+  if (failed) toast(`삭제하지 못한 파일 ${failed}개 · 연결을 확인해 주세요`, 3600);
+  else toast(`${done.size}개 삭제했습니다`);
+}
+
 function renderTimeline() {
   const list = $("#tl-list");
   if (!S.records.length) {
@@ -774,14 +1040,18 @@ function renderTimeline() {
   }));
   $$("#tl-list .card").forEach((c) => c.addEventListener("click", () => {
     const rec = S.records.find((r) => r.id === c.dataset.id);
-    if (rec) openDetail(rec);
+    if (!rec) return;
+    if (S.sel.on) { toggleSel(rec.id); return; }
+    openDetail(rec);
   }));
+  renderSelBar();
 }
 
 function cardHTML(r) {
   const t = TYPES[r.type] || TYPES.etc;
   const pending = r.status === "pending";
-  const line = r.summary?.one_line || (pending ? "맥에서 전사하면 요약이 표시됩니다" : "");
+  const line = previewLine(r);
+  const segLabel = recordSegmentLabel(r);
   const spk = (r.speakers || []).length;
   const metaBits = [];
   if (r.duration_sec) metaBits.push(fmtDuration(r.duration_sec));
@@ -790,11 +1060,14 @@ function cardHTML(r) {
   else if (r.source === "web") metaBits.push("웹 녹음");
   else if (r.source === "mic") metaBits.push("웹 녹음");
   if (pending) metaBits.push("전사 대기");
-  return `<button class="card ${pending ? "pending" : ""}" data-id="${esc(r.id)}">
+  const picked = S.sel.ids.has(r.id);
+  return `<button class="card ${pending ? "pending" : ""} ${S.sel.on ? "selectable" : ""} ${picked ? "on" : ""}" data-id="${esc(r.id)}">
+    ${S.sel.on ? `<span class="ck" aria-hidden="true">${picked ? "✓" : ""}</span>` : ""}
     <div class="card-time">${esc(fmtTime(r.started_at))}</div>
     <div>
       <div class="card-top">
         <span class="tag ${r.type === "meeting" ? "meeting" : ""}">${esc(t.label)}</span>
+        ${segLabel ? `<span class="tag seg">${esc(segLabel)}</span>` : ""}
         ${pending ? '<span class="tag pending">전사 대기</span>' : ""}
       </div>
       <h3 class="card-title">${esc(r.title)}</h3>
@@ -939,15 +1212,24 @@ function openDetail(rec, opts = {}) {
   if (sum.keywords?.length) bodyHTML += sec("키워드", `<div class="chips" style="padding:0;flex-wrap:wrap">${sum.keywords.map((k) => `<button class="chip" data-kw="${esc(k)}">${esc(k)}</button>`).join("")}</div>`);
 
   if (rec.segments?.length) {
-    bodyHTML += `<section class="detail-sec" style="padding-bottom:4px"><h3>전사 ${rec.segments.length}문장</h3><div class="tr-hint">문장을 누르면 그 지점부터 재생됩니다.</div></section>
-      <div class="transcript" id="transcript">${rec.segments.map((s) => `<button class="tr" data-t="${s.start}" data-i="${s.i}">
+    const lastStart = Number(rec.segments[rec.segments.length - 1]?.start) || 0;
+    const long = (rec.duration_sec || 0) > SEGMENT_SEC || lastStart > SEGMENT_SEC;
+    const blocks = long ? groupTranscript(rec.segments) : [{ label: "", segments: rec.segments }];
+    const trHTML = blocks.map((b) => `${b.label ? `<div class="tr-head">${esc(b.label)}</div>` : ""}${
+      b.segments.map((s) => `<button class="tr" data-t="${s.start}" data-i="${s.i}">
         <span class="tr-t">${fmtClock(s.start)}</span>
         <span class="tr-body">${s.speaker ? `<span class="tr-sp">${esc(s.speaker)}</span>` : ""}${esc(s.text)}</span>
-      </button>`).join("")}</div>`;
+      </button>`).join("")}`).join("");
+    bodyHTML += `<section class="detail-sec" style="padding-bottom:4px"><h3>전사 ${rec.segments.length}문장${long ? " · 30분 단위" : ""}</h3><div class="tr-hint">문장을 누르면 그 지점부터 재생됩니다.</div></section>
+      <div class="transcript" id="transcript">${trHTML}</div>`;
   }
 
   if (rec.webViewLink) {
     bodyHTML += `<section class="detail-sec"><a href="${esc(rec.webViewLink)}" target="_blank" rel="noopener" style="font-size:12.5px;color:var(--muted);text-decoration:underline;text-underline-offset:3px">드라이브에서 원본 열기</a></section>`;
+  }
+
+  if (S.mode === "live" && !rec.demo) {
+    bodyHTML += `<section class="detail-sec"><button class="link-danger" id="btn-del-one">이 녹음 삭제</button></section>`;
   }
 
   const hasAudio = !!rec.audioId && S.mode === "live";
@@ -963,6 +1245,7 @@ function openDetail(rec, opts = {}) {
         <button class="pl-btn small" id="pl-fwd" aria-label="15초 앞으로">+15</button>
         <button class="pl-btn small" id="pl-rate" aria-label="재생 속도">1×</button>
       </div>
+      <div class="pl-status" id="pl-status" hidden></div>
       ${hasAudio ? "" : '<div style="font-size:11px;color:var(--muted-2);margin-top:8px">데모 · 오디오 파일이 없습니다</div>'}`
     : "";
 
@@ -980,6 +1263,8 @@ function openDetail(rec, opts = {}) {
     $$("#search-mode button").forEach((x) => x.classList.toggle("on", x.dataset.mode === "search"));
     closeSheet(); setTab("search"); renderSearch();
   }));
+
+  $("#btn-del-one", sheet)?.addEventListener("click", () => confirmDeleteRecords([rec]));
 
   if (rec.status === "pending" && $("#btn-quick-transcribe")) {
     $("#btn-quick-transcribe").addEventListener("click", async (e) => {
@@ -1018,22 +1303,62 @@ function setupPlayer(rec, opts = {}) {
   let rate = 1;
   const nodes = {
     toggle: $("#pl-toggle"), fill: $("#pl-fill"), cur: $("#pl-cur"), dur: $("#pl-dur"),
-    title: $("#pl-title"), rate: $("#pl-rate"),
+    title: $("#pl-title"), rate: $("#pl-rate"), status: $("#pl-status"),
   };
   if (!nodes.toggle) return;
 
-  if (rec.audioId && S.mode === "live" && drive.token) {
-    audio.src = drive.audioUrl(rec.audioId);
-  }
-  let tokenRetried = false;
-  audio.addEventListener("error", async () => {
-    if (tokenRetried || !rec.audioId || S.mode !== "live") return;
-    tokenRetried = true;
-    try {
-      await drive.ensureToken();
-      audio.src = drive.audioUrl(rec.audioId);
-    } catch {}
+  const canLoad = !!(rec.audioId && S.mode === "live");
+  let objectUrl = null;
+  let loading = null;
+  let ready = false;
+  let durFixed = false;
+
+  const setStatus = (text, kind = "") => {
+    const el = nodes.status;
+    if (!el) return;
+    if (!text) { el.hidden = true; el.textContent = ""; el.className = "pl-status"; return; }
+    el.hidden = false;
+    el.textContent = text;
+    el.className = "pl-status" + (kind ? " " + kind : "");
+  };
+
+  /* 아이폰은 <audio src> 에 Authorization 헤더를 못 붙인다 → 토큰으로 받아 Blob URL 로 재생 */
+  const load = () => {
+    if (!canLoad) return Promise.reject(new Error("오디오 파일이 없습니다"));
+    if (ready) return Promise.resolve(objectUrl);
+    if (loading) return loading;
+    setStatus("오디오를 불러오는 중…", "loading");
+    nodes.toggle.classList.add("busy");
+    loading = (async () => {
+      let blob = audioCache.get(rec.audioId);
+      if (!blob) {
+        blob = await drive.audioBlob(rec.audioId, { name: rec.audioName || "" });
+        rememberAudio(rec.audioId, blob);
+      }
+      objectUrl = URL.createObjectURL(blob);
+      audio.src = objectUrl;
+      try { audio.load(); } catch {}
+      ready = true;
+      nodes.toggle.classList.remove("busy");
+      setStatus("");
+      return objectUrl;
+    })();
+    loading = loading.catch((e) => {
+      nodes.toggle.classList.remove("busy");
+      setStatus((e?.message || "오디오를 불러오지 못했습니다") + " · 다시 누르면 재시도합니다", "error");
+      ready = false;
+      loading = null;
+      throw e;
+    });
+    return loading;
+  };
+
+  const playNow = () => audio.play().then(() => setPlaying(true)).catch((e) => {
+    setStatus("재생할 수 없습니다 · " + (e?.name === "NotSupportedError" ? "이 기기에서 재생할 수 없는 형식입니다" : (e?.message || "오류")), "error");
+    setPlaying(false);
   });
+
+  const ensureThen = (fn) => { load().then(() => fn()).catch(() => {}); };
 
   const icon = (playing) => (playing
     ? '<svg viewBox="0 0 24 24" width="16" height="16"><rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/></svg>'
@@ -1044,34 +1369,51 @@ function setupPlayer(rec, opts = {}) {
   setPlaying(false);
 
   const seek = (t) => {
-    if (!audio.src) { highlightSegment(t); return; }
-    try { audio.currentTime = Math.max(0, t); } catch {}
-    if (!audio.paused) return;
-    audio.play().then(() => setPlaying(true)).catch(() => toast("오디오를 재생할 수 없습니다"));
+    const at = Math.max(0, Number(t) || 0);
+    if (!audio.src) {
+      if (!canLoad) { highlightSegment(at); return; }
+      ensureThen(() => { try { audio.currentTime = at; } catch {} playNow(); highlightSegment(at); });
+      return;
+    }
+    try { audio.currentTime = at; } catch {}
+    if (audio.paused) playNow();
   };
 
   nodes.toggle.addEventListener("click", () => {
     if (!audio.src) {
       if (rec.demo) return toast("데모에는 오디오가 없습니다");
-      return toast("오디오 파일이 없습니다");
+      if (!canLoad) return toast("오디오 파일이 없습니다");
+      ensureThen(playNow);
+      return;
     }
-    if (audio.paused) audio.play().then(() => setPlaying(true)).catch((e) => toast("재생 실패: " + e.message));
+    if (audio.paused) playNow();
     else { audio.pause(); setPlaying(false); }
   });
 
-  $("#pl-back").addEventListener("click", () => { audio.currentTime = Math.max(0, audio.currentTime - 15); });
-  $("#pl-fwd").addEventListener("click", () => { audio.currentTime = Math.min(audio.duration || 1e9, audio.currentTime + 15); });
-  nodes.rate.addEventListener("click", () => {
+  $("#pl-back")?.addEventListener("click", () => { audio.currentTime = Math.max(0, audio.currentTime - 15); });
+  $("#pl-fwd")?.addEventListener("click", () => { audio.currentTime = Math.min(audio.duration || 1e9, audio.currentTime + 15); });
+  nodes.rate?.addEventListener("click", () => {
     rate = rate === 1 ? 1.25 : rate === 1.25 ? 1.5 : rate === 1.5 ? 0.8 : 1;
     audio.playbackRate = rate;
     nodes.rate.textContent = rate + "×";
   });
 
+  const paintDuration = (d) => {
+    if (nodes.dur) nodes.dur.textContent = fmtClock(d || rec.duration_sec || 0);
+  };
   audio.addEventListener("loadedmetadata", () => {
-    if (isFinite(audio.duration)) nodes.dur.textContent = fmtClock(audio.duration);
+    if (isFinite(audio.duration) && audio.duration > 0) { paintDuration(audio.duration); return; }
+    // m4a 를 Blob 으로 재생할 때 duration 이 Infinity 로 나오는 iOS 버그 회피
+    if (!durFixed) { durFixed = true; try { audio.currentTime = 1e7; } catch {} }
+  });
+  audio.addEventListener("durationchange", () => {
+    if (isFinite(audio.duration) && audio.duration > 0) {
+      paintDuration(audio.duration);
+      if (durFixed) { try { audio.currentTime = 0; } catch {} }
+    }
   });
   audio.addEventListener("timeupdate", () => {
-    const d = audio.duration || rec.duration_sec || 1;
+    const d = audio.duration && isFinite(audio.duration) ? audio.duration : (rec.duration_sec || 1);
     nodes.fill.style.width = Math.min(100, (audio.currentTime / d) * 100) + "%";
     nodes.cur.textContent = fmtClock(audio.currentTime);
     highlightSegment(audio.currentTime);
@@ -1079,11 +1421,14 @@ function setupPlayer(rec, opts = {}) {
   audio.addEventListener("ended", () => setPlaying(false));
   audio.addEventListener("pause", () => setPlaying(false));
   audio.addEventListener("play", () => setPlaying(true));
+  audio.addEventListener("error", () => {
+    if (!audio.src) return;
+    ready = false;
+    setStatus("오디오 재생 오류 · 다시 누르면 재시도합니다", "error");
+  });
 
   let segNodes = [];
-  function collectSegNodes() {
-    segNodes = $$("#transcript .tr");
-  }
+  function collectSegNodes() { segNodes = $$("#transcript .tr"); }
   collectSegNodes();
 
   function highlightSegment(t) {
@@ -1118,7 +1463,13 @@ function setupPlayer(rec, opts = {}) {
     }, 260);
   }
 
-  S.player = { audio, rec, stop: () => { try { audio.pause(); audio.src = ""; } catch {} } };
+  S.player = {
+    audio, rec,
+    stop: () => {
+      try { audio.pause(); audio.src = ""; } catch {}
+      if (objectUrl) { try { URL.revokeObjectURL(objectUrl); } catch {} objectUrl = null; }
+    },
+  };
 }
 
 /* ────────────────────────────────── 시트 ── */
@@ -1494,7 +1845,7 @@ function openRecorder() {
       </div>
       <div class="rec-opt">
         <div class="rec-opt-txt"><b>침묵 구간 자동 건너뛰기</b>
-          <span>${vadOK ? "말하지 않는 동안은 소리를 담지 않고, 전사도 말한 구간만 합니다 (VAD)" : "이 브라우저에서는 사용할 수 없습니다"}</span></div>
+          <span>${vadOK ? "말하지 않는 동안의 침묵은 전사에서 걸러냅니다 · 소리는 그대로 담깁니다" : "이 브라우저에서는 사용할 수 없습니다"}</span></div>
         <button class="sw" id="rec-vad" role="switch" aria-checked="${vad && vadOK ? "true" : "false"}" aria-label="침묵 구간 자동 건너뛰기"${vadOK ? "" : " disabled"}><i></i></button>
       </div>
       <div class="rec-opt">
@@ -1599,6 +1950,9 @@ function openRecorder() {
         return toast("마이크를 사용할 수 없습니다: " + (e.message || "권한 확인"));
       }
       haptic(12);
+      // 30분마다 끊어 저장 + 기기 선저장 (수동 녹음도 동일하게)
+      beginLocalSession({ title: `새 녹음 ${fmtTime(new Date().toISOString())}`, type: localSettings().lastType || "work" });
+      startSegTimer(localSettings().lastType || "work", Date.now());
       mainBtn.textContent = "정지";
       mainBtn.classList.add("stop");
       pauseBtn.disabled = false;
@@ -1612,6 +1966,7 @@ function openRecorder() {
     }
     if (R.state === "recording" || R.state === "paused") {
       const out = await R.stop();
+      stopSegTimer();
       stopTimers();
       haptic([10, 40, 10]);
       mainBtn.textContent = "다시";
@@ -1622,7 +1977,7 @@ function openRecorder() {
       saved = out;
       timerEl.textContent = fmtClock(R.elapsedSec());
       paint();
-      showSaveForm(sheet, out, saveArea, () => { closeSheet(); });
+      showSaveForm(sheet, out, saveArea, () => { endLocalSession(); closeSheet(); });
       return;
     }
     // 다시
@@ -1658,6 +2013,8 @@ function openRecorder() {
     stopTimers();
     delRecListener(paint);
     if (S.recorder.state === "recording" || S.recorder.state === "paused") S.recorder.cancel();
+    stopSegTimer();
+    if (S.segSession) endLocalSession();
   };
 }
 
@@ -1687,6 +2044,7 @@ function showSaveForm(sheet, out, area, done) {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>';
     try {
+      saveSettings({ lastType: type });   // 다음 30분 세그먼트의 유형으로 기억
       await saveRecording({ blob: out.blob, duration: out.duration, mime: out.mime, name: out.name, title, type, speechSec: out.speechSec });
       toast("저장했습니다");
       done();
@@ -1761,10 +2119,24 @@ async function saveRecording({ blob, duration, mime, name, title, type, speechSe
   }
 
   const parent = meta.status === "done" ? await drive.monthFolder() : await drive.inbox();
-  const audioFile = await uploadWithRetry(blob, fileName, parent, mimeFor(ext));
+
+  // 0) 기기에 먼저 안전 저장 (업로드가 중간에 끊겨도 살아남게)
+  try {
+    await store.pendingPut({ id: fileName, blob, name: fileName, parent, mime: mimeFor(ext), at: Date.now(), title, type, duration, speechSec, meta });
+  } catch (e) { console.warn("local first save failed", e); }
+
+  let audioFile;
+  try {
+    audioFile = await uploadWithRetry(blob, fileName, parent, mimeFor(ext));
+  } catch (e) {
+    // pending 큐에 이미 있다 — 다음 동기화에서 다시 올라간다
+    toast("기기에 보관했습니다 · 연결되면 올라갑니다", 3200);
+    throw e;
+  }
   meta.audio = { file_id: audioFile.id, file_name: fileName, size: blob.size };
 
   await drive.upload(new Blob([JSON.stringify(meta, null, 2)], { type: "application/json" }), `${base}.json`, parent, { mimeType: "application/json" });
+  await store.pendingDel(fileName).catch(() => {});
 
   S.records.unshift(normalizeRecord(meta, { id: audioFile.id + "-json", name: `${base}.json`, modifiedTime: new Date().toISOString(), base, folderName: "" }, { id: audioFile.id, name: fileName }));
   reindex();
@@ -1776,7 +2148,7 @@ async function uploadWithRetry(blob, fileName, parent, mime) {
   try {
     return await drive.upload(blob, fileName, parent, { mimeType: mime });
   } catch (e) {
-    // 오프라인: 기기에 보관했다가 다음 연결 때 재시도
+    // 오프라인: 기기에 보관했다가 다음 연결 때 재시도 (pendingPut 은 호출 측에서 이미 했다)
     await store.pendingPut({ id: fileName, blob, name: fileName, parent, mime, at: Date.now(), title: fileName });
     throw new Error("네트워크 문제로 기기에 보관했습니다. 연결되면 다시 올라갑니다.");
   }
@@ -1850,6 +2222,8 @@ async function startAutoRecording(day) {
   S.auto.on = true;
   S.auto.startedAt = Date.now();
   S.auto.type = getSchedule().type || "work";
+  beginLocalSession({ title: `예약 녹음 ${fmtTime(new Date().toISOString())}`, type: S.auto.type });
+  startSegTimer(S.auto.type, S.auto.startedAt);
   haptic(12);
   clearInterval(S.auto.timer);
   S.auto.timer = setInterval(renderAutoBar, 1000);
@@ -1862,13 +2236,25 @@ async function stopAutoRecording({ reason = "end" } = {}) {
   if (!S.auto.on) return;
   clearInterval(S.auto.timer);
   S.auto.timer = null;
+  stopSegTimer();
+  const segIndex = S.seg.index;
+  const segStart = S.seg.startAt || S.auto.startedAt;
   const out = await S.recorder.stop();
   S.auto.on = false;
   renderAutoBar();
-  if (!out || !out.blob?.size) return;
-  const title = `예약 녹음 ${fmtTime(new Date().toISOString())}`;
+  if (!out || !out.blob?.size) { endLocalSession(); return; }
+  const endAt = Date.now();
+  const label = segmentRangeLabel(segStart, endAt);
+  const title = segIndex === 0
+    ? `예약 녹음 ${fmtTime(new Date(segStart).toISOString())}`
+    : `${label} 녹음`;
   try {
-    await saveRecordingFast({ blob: out.blob, duration: out.duration, mime: out.mime, title, type: S.auto.type || "work", speechSec: out.speechSec });
+    await saveRecordedOut(out, {
+      title, type: S.auto.type || "work",
+      startedAt: new Date(segStart).toISOString(),
+      segment: { index: segIndex, start: new Date(segStart).toISOString(), end: new Date(endAt).toISOString(), label },
+    });
+    endLocalSession();
     toast(reason === "end" ? "예약 시간이 끝나 자동 저장했습니다" : "예약 녹음을 저장했습니다");
   } catch (e) {
     toast("기기에 보관했습니다 · 연결되면 올라갑니다");
@@ -1907,6 +2293,9 @@ async function rescueRecording(reason = "hidden") {
     const wasAuto = S.auto.on;
     clearInterval(S.auto.timer);
     S.auto.timer = null;
+    stopSegTimer();
+    const segIndex = S.seg.index;
+    const segStart = S.seg.startAt || Date.now();
     const out = await R.stop();
     S.auto.on = false;
     S.face.active = false;
@@ -1917,11 +2306,19 @@ async function rescueRecording(reason = "hidden") {
     flip.markStopped();
     renderAutoBar();
     if (S.sheet?._rec) closeSheet();
-    if (!out || !out.blob?.size) return;
+    if (!out || !out.blob?.size) { endLocalSession(); return; }
+    const endAt = Date.now();
+    const label = segmentRangeLabel(segStart, endAt);
     const title = wasAuto
-      ? `예약 녹음 ${fmtTime(new Date().toISOString())}`
-      : `자동 저장 ${fmtTime(new Date().toISOString())}`;
-    await saveRecordingFast({ blob: out.blob, duration: out.duration, mime: out.mime, title, type: wasAuto ? S.auto.type : "work", speechSec: out.speechSec });
+      ? `예약 녹음 ${fmtTime(new Date(segStart).toISOString())}`
+      : `자동 저장 ${fmtTime(new Date(segStart).toISOString())}`;
+    await saveRecordingFast({
+      blob: out.blob, duration: out.duration, mime: out.mime, title,
+      type: wasAuto ? S.auto.type : "work", speechSec: out.speechSec,
+      started_at: new Date(segStart).toISOString(),
+      segment: { index: segIndex, start: new Date(segStart).toISOString(), end: new Date(endAt).toISOString(), label },
+    });
+    endLocalSession();
   } catch (e) {
     console.warn("rescue save failed", reason, e);
   } finally {
@@ -1930,7 +2327,7 @@ async function rescueRecording(reason = "hidden") {
 }
 
 /* 기기 큐에 먼저 넣고, 이어서 드라이브 업로드를 시도한다(성공하면 큐에서 제거) */
-async function saveRecordingFast({ blob, duration, mime, title, type = "work", speechSec }) {
+async function saveRecordingFast({ blob, duration, mime, title, type = "work", speechSec, started_at = null, segment = null, source = "web" }) {
   if (S.mode !== "live") throw new Error("데모에서는 저장되지 않습니다");
   const ext = extFor(mime || blob.type, "");
   const base = `${stamp()}_${type}_${uid(6)}`;
@@ -1940,12 +2337,14 @@ async function saveRecordingFast({ blob, duration, mime, title, type = "work", s
   try { parent = await drive.inbox(); } catch {}
   // 1) 로컬 큐(IndexedDB)에 먼저 보관 — 화면이 가려져도 유실되지 않게
   try {
-    await store.pendingPut({ id: fileName, blob, name: fileName, parent, mime: mimeType, at: Date.now(), title, type, duration, speechSec });
+    await store.pendingPut({ id: fileName, blob, name: fileName, parent, mime: mimeType, at: Date.now(), title, type, duration, speechSec, started_at, segment });
   } catch (e) { console.warn("queue failed", e); }
   // 2) 드라이브 업로드 시도
   if (parent) {
     await drive.upload(blob, fileName, parent, { mimeType });
     await store.pendingDel(fileName).catch(() => {});
+  } else {
+    throw new Error("연결되지 않아 기기에만 보관했습니다");
   }
   syncNow().catch(() => {});
   return fileName;
@@ -1963,6 +2362,63 @@ async function flushPending() {
       await store.pendingDel(it.id);
     } catch { break; }
   }
+}
+
+/* ── 기기에 남은 녹음 복구 ──────────────────────────────
+   녹음 중 청크를 IndexedDB 에 적립해 두었으므로, 앱이 강제 종료되거나
+   업로드가 실패해도 다음 실행에서 '복구'로 되살릴 수 있다. */
+async function checkLocalRecovery() {
+  if (S.mode !== "live") return;
+  const box = $("#recovery");
+  if (!box) return;
+  let groups = [], meta = null;
+  try {
+    groups = await store.partGroups();
+    meta = await store.sessionGet();
+  } catch { return; }
+  const cand = groups.find((g) => g.bytes >= 2000 && (!S.segSession || g.key !== S.segSession.id));
+  if (!cand) { box.hidden = true; box.innerHTML = ""; return; }
+  const latest = cand.parts[cand.parts.length - 1];
+  const startedAt = meta && meta.id === cand.key ? meta.startedAt : cand.at;
+  const title = (meta && meta.id === cand.key ? meta.title : "") || "녹음";
+  const dur = Math.round(cand.bytes / 8000); // 64kbps 기준 대략치
+  box.hidden = false;
+  box.innerHTML = `<div class="rec-card">
+      <div class="rc-main"><b>저장되지 않은 녹음이 있습니다</b><span>${esc(title)} · 약 ${fmtClock(dur)} · ${esc(fmtDay(startedAt))} ${esc(fmtTime(startedAt))}</span></div>
+      <button class="db-btn" id="rec-ok">복구</button>
+      <button class="db-btn" id="rec-no">버리기</button>
+    </div>`;
+  $("#rec-ok", box).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "복구 중…";
+    try {
+      const type = cand.parts[0]?.blob?.type || "audio/mp4";
+      const blob = new Blob(cand.parts.map((p) => p.blob), { type });
+      if (!blob.size) throw new Error("복구할 데이터가 없습니다");
+      const duration = await probeDuration(blob);
+      await saveRecordingFast({
+        blob, duration, mime: type,
+        title: `${title} (복구)`,
+        type: (meta && meta.id === cand.key && meta.type) || "work",
+        started_at: startedAt ? new Date(startedAt).toISOString() : null,
+      });
+      await store.partClearGroup(cand.key);
+      if (meta && meta.id === cand.key) await store.sessionDel();
+      box.hidden = true; box.innerHTML = "";
+      toast("기기에 있던 녹음을 저장했습니다");
+      checkLocalRecovery().catch(() => {});
+    } catch (err) {
+      btn.disabled = false; btn.textContent = "복구";
+      toast("복구하지 못했습니다: " + (err.message || err));
+    }
+  });
+  $("#rec-no", box).addEventListener("click", async () => {
+    await store.partClearGroup(cand.key).catch(() => {});
+    if (meta && meta.id === cand.key) await store.sessionDel().catch(() => {});
+    box.hidden = true; box.innerHTML = "";
+    toast("임시 저장을 지웠습니다");
+    checkLocalRecovery().catch(() => {});
+  });
 }
 
 /* ────────────────────────────────── 홈 화면 추가 안내 ── */
