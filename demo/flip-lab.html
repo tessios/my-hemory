@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Hemory · 센서 테스트</title>
+<style>
+  :root{--ink:#111;--muted:#8a8a8a;--line:#e6e6e6;--chip:#f2f2f2}
+  *{box-sizing:border-box}
+  body{margin:0;padding:22px 18px calc(28px + env(safe-area-inset-bottom));font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo",system-ui,sans-serif;color:var(--ink);background:#fff;-webkit-text-size-adjust:100%}
+  h1{font-size:19px;letter-spacing:-.02em;margin:0 0 4px}
+  p.sub{margin:0 0 20px;color:var(--muted);font-size:12.5px;line-height:1.55}
+  .card{border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:10px;font-size:13px;padding:5px 0}
+  .row b{font-weight:600}
+  .val{font-variant-numeric:tabular-nums;color:#333}
+  .pose{margin-top:10px;border-radius:12px;padding:14px;text-align:center;font-size:15px;font-weight:700;background:var(--chip);transition:background .2s,color .2s}
+  .pose[data-pose="down"]{background:#111;color:#fff}
+  button{font:inherit;font-size:13.5px;font-weight:600;border-radius:12px;padding:11px 14px;border:1px solid var(--line);background:#fff;color:var(--ink);width:100%;margin-top:8px}
+  button.primary{background:#111;color:#fff;border-color:#111}
+  button:active{opacity:.8}
+  .btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .btns button{margin-top:0}
+  .log{margin-top:6px;font-size:12px;line-height:1.7;color:#555;white-space:pre-wrap;font-variant-numeric:tabular-nums;max-height:180px;overflow:auto}
+  .note{font-size:11.5px;color:var(--muted);line-height:1.6;margin:14px 0 0}
+  .back{display:inline-block;margin-bottom:14px;font-size:12.5px;color:var(--muted);text-decoration:none}
+</style>
+</head>
+<body>
+<a class="back" href="../">← Hemory로</a>
+<h1>뒤집어 녹음 · 센서 테스트</h1>
+<p class="sub">녹음은 하지 않고, 폰을 엎었을 때 센서가 그걸 알아보는지만 확인합니다. 아이폰에서는 <b>권한 요청</b>을 먼저 누르세요.</p>
+
+<div class="card">
+  <div class="row"><span>센서 권한</span><b id="perm">—</b></div>
+  <div class="row"><span>감시</span><b id="watch">꺼짐</b></div>
+  <div class="row"><span>방향 beta</span><span class="val" id="beta">—</span></div>
+  <div class="row"><span>중력 z</span><span class="val" id="gz">—</span></div>
+  <div class="pose" id="pose" data-pose="none">신호를 기다리는 중</div>
+</div>
+
+<button class="primary" id="ask">1) 센서 권한 요청 · 감시 시작</button>
+<button id="stop">감시 정지</button>
+
+<div class="card" style="margin-top:12px">
+  <div class="row" style="padding-top:0"><span>가짜 신호 보내기(브라우저 테스트용)</span></div>
+  <div class="btns">
+    <button data-fake="up">화면 위 (0°)</button>
+    <button data-fake="down">엎음 (180°)</button>
+    <button data-fake="tilt">들고 있음 (90°)</button>
+    <button data-fake="hold">엎은 채 2초 유지</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row" style="padding-top:0"><span>기록</span></div>
+  <div class="log" id="log">—</div>
+</div>
+
+<p class="note">아이폰에서: ① 권한 요청을 누르고 “허용” ② 폰을 책상에 엎으면 판정이 <b>엎임</b>으로 바뀌고 1.5초 뒤 “녹음 시작”이 기록됩니다 ③ 다시 들면 0.6초 뒤 “정지·저장”. 여기서 안 되면 Hemory 본 앱에서도 안 되니, 설정 → 동작 및 방향 접근을 확인해 주세요.</p>
+
+<script type="module">
+import { FlipWatcher } from "../js/flip.js";
+
+const $ = (s) => document.querySelector(s);
+const logEl = $("#log");
+const lines = [];
+function log(msg) {
+  lines.unshift(`${new Date().toLocaleTimeString("ko-KR", { hour12: false })} · ${msg}`);
+  logEl.textContent = lines.slice(0, 12).join("\n");
+}
+
+const flip = new FlipWatcher({
+  onStart: async () => { log("녹음 시작(테스트)"); return true; },
+  onStop: () => log("정지·자동 저장(테스트)"),
+  onState: (s) => { $("#watch").textContent = s; },
+  onSample: (w) => {
+    $("#beta").textContent = w.last.beta == null ? "—" : `${Math.round(w.last.beta)}°`;
+    $("#gz").textContent = w.last.gz == null ? "—" : w.last.gz.toFixed(2);
+    $("#perm").textContent = w.perm === "denied" ? "차단됨" : w.granted ? "허용됨" : "필요";
+    const el = $("#pose");
+    el.dataset.pose = w.pose;
+    el.textContent = w.active ? "녹음 중(테스트)" : w.poseLabel;
+  },
+});
+flip.setArmed(true);
+
+$("#ask").addEventListener("click", async () => {
+  const r = await flip.requestPermission();
+  log(r.ok ? "센서 권한 허용" : "센서 권한 거부");
+  flip.setArmed(true);
+  flip.start();
+});
+$("#stop").addEventListener("click", () => { flip.disable(); flip.setArmed(true); log("감시 정지"); });
+
+function fake(pose) {
+  const frames = {
+    up:   [{ z: -9.8, beta: 0 }],
+    down: [{ z: 9.8, beta: 180 }],
+    tilt: [{ z: -0.3, beta: 90 }],
+  };
+  if (pose === "hold") {
+    // 엎은 상태를 2초 유지한 것처럼: 같은 값을 여러 번 보내되 실제 시계는 그대로 흐르게 둔다
+    let n = 0;
+    const t = setInterval(() => {
+      send({ z: 9.8, beta: 180 });
+      if (++n >= 20) clearInterval(t);
+    }, 100);
+    log("가짜 신호: 엎음 2초");
+    return;
+  }
+  for (const f of frames[pose] || []) send(f);
+  log(`가짜 신호: ${pose}`);
+}
+
+function send({ z, beta }) {
+  window.dispatchEvent(new DeviceMotionEvent("devicemotion", {
+    accelerationIncludingGravity: { x: 0, y: 0, z },
+  }));
+  window.dispatchEvent(new DeviceOrientationEvent("deviceorientation", { beta, gamma: 0, alpha: 0 }));
+}
+document.querySelectorAll("[data-fake]").forEach((b) => b.addEventListener("click", () => fake(b.dataset.fake)));
+</script>
+</body>
+</html>

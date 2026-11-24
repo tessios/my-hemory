@@ -1279,6 +1279,7 @@ async function renderSettings() {
       <div class="flip-verdict" id="s-flip-verdict" data-pose="${flip.pose}">${flip.active ? "녹음 중입니다" : "폰을 엎으면 이 칸이 검게 바뀝니다"}</div>
     </div>
     <button class="btn btn-line btn-block" id="s-flip-perm">센서 권한 허용 · 다시 요청</button>
+    <a class="btn btn-ghost btn-block" href="demo/flip-lab.html" target="_blank" rel="noopener">센서 테스트 열기 (녹음 없이 확인)</a>
     <p class="note">켜 두면 <b>어느 화면에 있든</b> 폰을 엎기만 하면 1.5초 뒤 녹음이 시작되고 화면은 검게 절전합니다. 다시 들면 자동 저장.<br>
     아이폰은 앱을 새로 열 때마다 센서 권한을 한 번 더 물어봅니다(브라우저 보안 규칙). 위 상태가 <b>허용됨 · 신호 정상</b>이면 준비된 것이고, <b>확인 필요</b>면 <b>센서 권한 허용</b>을 한 번 눌러 주세요. 켤 때 마이크 권한도 함께 미리 허용해 둡니다.</p>
   </div>

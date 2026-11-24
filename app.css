@@ -128,7 +128,7 @@ input{font:inherit;color:inherit}
 .field input{width:100%;padding:12px 13px;border:1px solid var(--line-2);border-radius:11px;font-size:13.5px;outline:none;background:#fff}
 .field input:focus{border-color:#111}
 .field .hint{font-size:11.5px;color:var(--muted-2);margin-top:6px;line-height:1.55}
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border-radius:12px;font-size:14.5px;font-weight:600;padding:13px 18px;transition:opacity .15s,background .15s}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;border-radius:12px;font-size:14.5px;font-weight:600;padding:13px 18px;transition:opacity .15s,background .15s;text-decoration:none}
 .btn:active{opacity:.7}
 .btn-primary{background:#111;color:#fff}
 .btn-ghost{background:var(--chip);color:var(--ink)}
