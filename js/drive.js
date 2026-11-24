@@ -86,8 +86,6 @@ export const drive = {
     const auth = readJSON(AUTH_KEY, {});
     this.needsReconnect = !!auth.needsReconnect;
     this._navDeadline = Date.now() + NAV_WINDOW;
-    /* TEMP-TEST: ?hemory-expired=1 로 토큰을 강제 만료시켜 재실행 상황을 검사 (검증 후 제거) */
-    if (location.search.indexOf("hemory-expired") >= 0) { this.expiresAt = 0; this.token = this.token || "FORCED"; }
     return this;
   },
 
