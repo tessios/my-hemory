@@ -1,5 +1,26 @@
 # 맥(Sophias-iMac) 전사 파이프라인 설치·예약
 
+> **2026-11-24 이 맥에 설치·가동 완료.** 상태: `~/hemory-pipeline` 설치, Python 3.14.7 가상환경에 faster-whisper 1.2.1, 백엔드 **drive**(드라이브 데스크톱 앱이 없어서 API 경로), `~/.config/hemory/token.json` 발급, launchd `com.hemory.pipeline` 30분 간격 등록·실행 확인. 아래는 같은 일을 다시 하거나 다른 맥에 설치할 때의 절차입니다.
+
+## 이 맥에서 실측한 값 (2026-11-24)
+
+| 항목 | 값 |
+|---|---|
+| 설치 경로 | `/Users/sophiakim/hemory-pipeline` (소스 사본 `~/hemory-src`) |
+| 백엔드 | `drive` — `~/Library/CloudStorage` 에 iCloudDrive만 있고 Google Drive 데스크톱 없음 |
+| 자격 | `~/.config/hemory/client_secret.json`(데스크톱 앱 클라이언트) · `token.json`(refresh token, mode 600) |
+| 실행 | `launchctl list \| grep hemory` → `com.hemory.pipeline`, 30분(1800초)·로그인 시 1회 |
+| 로그 | `~/Library/Logs/hemory-pipeline.log` |
+| whisper | `medium`, CPU int8 — 13초 음성을 약 11초에 전사(모델 최초 다운로드 약 2.5분) |
+| 요약 | **미설정(Gemini 키 없음)** — 전사만 저장되고 `요약 실패(...)` 로그가 남습니다 |
+
+### 이 맥에서 반드시 필요한 두 가지 (설치본에 반영됨)
+
+1. **SSL 인증서** — macOS 프레임워크 파이썬은 루트 인증서가 없어 Google API 호출이 `CERTIFICATE_VERIFY_FAILED` 로 죽습니다.
+   → `requirements.txt` 에 `certifi` 를 넣고, `run-hemory.sh` 가 `SSL_CERT_FILE` 을 certifi 번들로 지정합니다.
+2. **PyAV 19 호환** — `av.open(metadata_errors=...)` 인자가 PyAV 19 에서 사라져 faster-whisper 1.2.x 전사가 `TypeError` 로 실패합니다.
+   → `hemory_pipeline.py` 의 `_patch_pyav_compat()` 가 그 인자만 걸러 호출합니다.
+
 녹음 파일은 드라이브에만 있고, 맥이 주기적으로 훑어 **전사 → 화자 추정 → 유형 분류 → 요약** 후 JSON을 만들어 앱이 읽습니다.
 맥이 꺼져 있으면 전사만 밀리고(녹음은 그대로 드라이브에 있음), 켜지면 다음 실행에 처리됩니다.
 
@@ -141,3 +162,21 @@ tail -f ~/Library/Logs/hemory-pipeline.log
 - `--purge`: `_trash` 에서 30일 지난 것만 실제 삭제. `run-hemory.sh` 는 이 옵션으로 돌므로 **총 395일 뒤 완전 삭제**.
 - 드라이브 백엔드에서는 실제 삭제 대신 드라이브 **휴지통**으로 보냅니다(30일 후 자동 삭제).
 - 기록: `Hemory-개인녹음/_state/prune-log.jsonl`, 실행 로그: `~/Library/Logs/hemory-pipeline.log`
+
+## 드라이브 백엔드에서의 365일 정리 (실측)
+
+`backend: drive` 이면 365일 지난 오디오+JSON 을 `_trash/` 폴더로 옮기는 대신 **드라이브 휴지통으로 보냅니다**(휴지통은 30일 뒤 Google이 자동 삭제). 실측 로그:
+
+```
+[12:29:35] 정리 시작 · 백엔드=drive · 보관 365일 · dry_run=False
+[12:29:38]  드라이브 휴지통은 30일 뒤 자동 삭제됩니다(추가 조치 없음)
+[12:29:38] 이동 0건 · 삭제 0건 · 보존 0건
+```
+
+(로컬 백엔드는 `_trash/YYYY-MM/` 로 이동 → 30일 뒤 `--purge` 로 실제 삭제. `_trash` 폴더는 drive 백엔드에서 쓰지 않습니다.)
+
+## 검증 기록 (2026-11-24)
+
+- 한국어 TTS 샘플(13초)을 `_inbox` 에 올려 전 구간 확인: `inbox 오디오 1개` → whisper 전사 4문장 → `Hemory-개인녹음/2026-11/*.json` 저장(`schema: hemory.transcript.v1`) → 오디오를 월 폴더로 이동 → 앱에서 동기화해 표시·재생 확인.
+- 정리 경로: `retention_days` 를 잠시 0으로 두고 실행 → 월 폴더의 오디오+JSON 이 정리되고(드라이브 백엔드는 휴지통) 원래 365로 복구.
+- launchd 경로: `launchctl start com.hemory.pipeline` → 전사·정리 둘 다 exit 0, 로그 정상.

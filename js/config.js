@@ -1,11 +1,11 @@
 /* Hemory 개인용 · 설정
    clientId 는 Google Cloud Console > API 및 서비스 > 사용자 인증 정보 >
    OAuth 클라이언트 ID(웹 애플리케이션) 에서 만든 값입니다.
-   (2026-11-24: 프로젝트 my-hemory 의 "Hemory Web" 클라이언트 — 공개 식별자라 저장소에 넣어도 안전)
+   (2026-11-24: 개인 모드 프로젝트 personal-mode-app 의 "Hemory Web (personal)" 클라이언트 — 공개 식별자라 저장소에 넣어도 안전)
    비워 두면 앱 첫 화면의 "처음 설정"에서 직접 입력할 수 있습니다(폰에만 저장). */
 export const CONFIG = {
-  version: "1.2.0",
-  clientId: "575274104123-er0hmg08l76erlfnd6cmok0hpqrtplt3.apps.googleusercontent.com",
+  version: "1.3.0",
+  clientId: "746533653611-s8keromh27u55lptk5l05guldvhiq7lo.apps.googleusercontent.com",
   rootFolder: "Hemory-개인녹음",       // 내 드라이브 안의 전용 폴더
   inboxFolder: "_inbox",             // 아이폰 음성메모·단축어가 올리는 곳
   trashFolder: "_trash",             // 365일 지난 파일 보관(맥이 이동)
