@@ -745,9 +745,9 @@ def scan_inbox(be, cfg: dict) -> list[dict]:
         it["from_inbox"] = True
         items.append(it)
     # 월 폴더에 오디오만 있고 JSON 이 없는 경우(업로드 중단·수동 복사)도 복구
-    for folder in list_month_folders(be):
-        for it in be.list_audio(folder):
-            if not be.has_json(folder, it["base"]):
+    for folder_id, _name in list_month_folders(be):
+        for it in be.list_audio(folder_id):
+            if not be.has_json(folder_id, it["base"]):
                 it["from_inbox"] = False
                 items.append(it)
     return items
