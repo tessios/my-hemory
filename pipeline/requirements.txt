@@ -1,6 +1,9 @@
 # 전사(로컬, 무료) — Apple Silicon CPU int8 기준 medium 모델 권장
 faster-whisper>=1.0.3
 
+# macOS 프레임워크 파이썬은 루트 인증서가 없어 Google API 호출이 SSL 오류 → certifi 번들 사용
+certifi>=2024.2.2
+
 # (선택) 정확한 화자 분리 — HuggingFace 토큰 필요
 # pyannote.audio>=3.1.1
 

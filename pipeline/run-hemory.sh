@@ -10,6 +10,11 @@ mkdir -p "$(dirname "$LOG")"
 # Gemini API 키를 쓰는 경우: ~/.config/hemory/env 에 export GEMINI_API_KEY=... 로 두세요.
 [ -f "$HOME/.config/hemory/env" ] && source "$HOME/.config/hemory/env"
 
+# macOS 프레임워크 파이썬은 루트 인증서가 없어 Google API 호출이 SSL 오류가 납니다 → venv의 certifi 사용
+if [ -x "$HOME/hemory-pipeline/.venv/bin/python" ]; then
+  export SSL_CERT_FILE="$("$HOME/hemory-pipeline/.venv/bin/python" -c 'import certifi;print(certifi.where())' 2>/dev/null || true)"
+fi
+
 cd "$HEMORY_DIR"
 if [ -x "$HEMORY_DIR/.venv/bin/python" ]; then PY="$HEMORY_DIR/.venv/bin/python"; else PY="$(command -v python3)"; fi
 

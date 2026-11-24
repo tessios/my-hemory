@@ -77,7 +77,7 @@ def prune_drive(be: DriveBackend, cfg: dict, days: int, dry: bool, purge_days: i
     cutoff = now_local() - dt.timedelta(days=days)
     root = be.root()
     q = f"'{root}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
-    j = be._req("GET", f"{be.API}/files?q={q}&fields=files(id,name)&pageSize=200")
+    j = be._req("GET", f"{be.API}/files?q={urllib.parse.quote(q)}&fields=files(id,name)&pageSize=200")
     folders = [(f["id"], f["name"]) for f in j.get("files", []) if MONTH_RE.match(f["name"])]
 
     for fid, fname in folders:
