@@ -209,24 +209,79 @@ function updateSleepOverlay() {
 async function boot() {
   drive.init();
   $("#app-version").textContent = CONFIG.version;
-  let redirected = false;
-  try { redirected = drive.consumeRedirect(); } catch {}
+
+  let redirect = { ok: false };
+  try { redirect = drive.consumeRedirect() || { ok: false }; } catch {}
 
   bindGlobal();
-  if (redirected && drive.signedIn) {
+
+  const notice = (() => { try { return localStorage.getItem("hemory.authNotice") || ""; } catch { return ""; } })();
+  if (notice) {
+    try { localStorage.removeItem("hemory.authNotice"); } catch {}
+    setTimeout(() => toast(notice, 4500), 500);
+  }
+
+  // 한 번이라도 로그인했다면 토큰이 만료돼도 첫 화면으로 돌아가지 않는다.
+  if (drive.hasSession) {
     enterLive();
+    if (redirect.ok) toast(redirect.silent ? "Google 연결을 자동으로 갱신했습니다" : "Google 계정에 연결했습니다", 1800);
+    else if (redirect.error) showConnBar();
     return;
   }
-  if (drive.signedIn) {
-    // 저장된 토큰이 살아 있으면 바로 시작하되, 실패하면 게이트로
-    enterLive();
-    return;
-  }
+
   showScreen("gate");
   if (!drive.configured) $("#btn-signin").textContent = "처음 설정이 필요합니다";
 }
 
+/* 녹음 중이거나 시트가 열려 있으면 Google로 화면을 넘기지 않는다 */
+function canLeaveApp() {
+  if (S.recorder.state !== "idle") return false;
+  if (S.face.active || S.auto.on) return false;
+  if (S.sheet?._rec) return false;
+  if ($("#sheet-root").querySelector(".sheet")) return false;
+  if (document.visibilityState !== "visible") return false;
+  return true;
+}
+
+/* ── 연결 상태 막대 ───────────────────────── */
+function showConnBar() {
+  const el = $("#conn-bar");
+  if (!el || S.mode !== "live") return;
+  el.hidden = false;
+}
+function hideConnBar() {
+  const el = $("#conn-bar");
+  if (el) el.hidden = true;
+}
+
+/* 앱으로 돌아왔을 때: 토큰이 죽어 있으면 조용한 갱신을 한 번 시도 */
+function resumeConnection() {
+  if (S.mode !== "live" || !drive.hasSession) return;
+  if (drive.tokenValid) { hideConnBar(); return; }
+  drive.ensureToken()
+    .then(() => { hideConnBar(); if (S.mode === "live") syncNow(); })
+    .catch((e) => { if (e?.code === "needs_reconnect") showConnBar(e.code); });
+}
+
+async function reconnect() {
+  hideConnBar();
+  try {
+    toast("Google 연결을 확인합니다…");
+    await drive.signIn({ interactive: true });
+    if (drive.signedIn) {
+      toast("연결되었습니다");
+      syncNow({ manual: true });
+    }
+  } catch (e) {
+    if (e?.code === "cancelled") return;
+    toast(e?.message || "다시 연결하지 못했습니다");
+    showConnBar();
+  }
+}
+
 function bindGlobal() {
+  drive.canNavigate = canLeaveApp;
+  $("#conn-bar")?.addEventListener("click", reconnect);
   $("#btn-signin").addEventListener("click", async () => {
     if (!drive.configured) return openSetupSheet();
     try {
@@ -263,7 +318,26 @@ function bindGlobal() {
 
   window.addEventListener("online", () => { if (S.mode === "live") syncNow(); });
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
+    let swReloaded = false;
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register("sw.js").then((reg) => {
+      reg.addEventListener?.("updatefound", () => {
+        const w = reg.installing;
+        if (!w) return;
+        w.addEventListener("statechange", () => {
+          if (w.state === "installed" && navigator.serviceWorker.controller) {
+            try { reg.waiting?.postMessage({ type: "SKIP_WAITING" }); } catch {}
+            toast("새 버전이 준비되어 다시 열겠습니다", 1800);
+          }
+        });
+      });
+    }).catch(() => {});
+    navigator.serviceWorker.addEventListener("controllerchange", () => {
+      if (swReloaded || !hadController) return;
+      swReloaded = true;
+      // 녹음 중·시트 열림이면 건드리지 않는다 (다음 실행에 반영)
+      if (canLeaveApp()) location.reload();
+    });
   }
 
   /* 녹음 상태 → 화면 조각들 */
@@ -274,7 +348,7 @@ function bindGlobal() {
   /* 화면이 가려지기 전까지 모인 소리는 잃지 않게 저장 */
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") rescueRecording("hidden");
-    else { schedTick(); renderAutoBar(); }
+    else { schedTick(); renderAutoBar(); resumeConnection(); }
   });
   window.addEventListener("pagehide", () => { rescueRecording("pagehide"); });
 
@@ -336,9 +410,10 @@ async function enterLive() {
   S.mode = "live";
   showChrome();
   drive.about().then((u) => {
-    if (u.emailAddress) localStorage.setItem("hemory.email", u.emailAddress);
+    if (u.emailAddress) { drive.email = u.emailAddress; localStorage.setItem("hemory.email", u.emailAddress); }
     if (S.tab === "settings") renderSettings();
   }).catch(() => {});
+  if (drive.needsReconnect && !drive.tokenValid) showConnBar();
   const cached = await store.allRecords().catch(() => []);
   if (cached.length) {
     S.records = cached.sort(byRecent);
@@ -443,6 +518,7 @@ async function syncNow({ manual = false } = {}) {
     S.records = next.sort(byRecent);
     reindex();
     await store.replaceAll(S.records.filter((r) => !r.demo)).catch(() => {});
+    hideConnBar();
     S.lastSync = Date.now();
     await store.setKV("lastSync", S.lastSync).catch(() => {});
     flushPending().catch(() => {});
@@ -455,8 +531,9 @@ async function syncNow({ manual = false } = {}) {
     S.syncState = "idle";
     $("#btn-sync").classList.remove("spin");
     if (e instanceof AuthError) {
-      toast(e.message);
-      if (e.code === "expired") { showScreen("gate"); $("#tabbar").hidden = true; }
+      // 토큰이 만료된 것이지 로그아웃된 것이 아니다. 첫 화면으로 돌아가지 않는다.
+      if (e.code === "needs_reconnect") showConnBar(e.code);
+      else toast(e.message);
     } else {
       toast("동기화 실패: " + (e.message || "알 수 없는 오류"));
     }
@@ -1021,6 +1098,13 @@ function closeSheet(immediate = false) {
 }
 
 /* ────────────────────────────────── 설정 ── */
+function connState() {
+  if (!drive.hasSession) return "—";
+  if (drive.tokenValid) return "자동 유지 중";
+  if (drive.needsReconnect) return "다시 연결 필요";
+  return "자동 갱신 중";
+}
+
 async function renderSettings() {
   const body = $("#settings-body");
   const s = localSettings();
@@ -1040,10 +1124,12 @@ async function renderSettings() {
     <h2>계정</h2>
     <div class="srow"><span class="k">${S.mode === "live" ? "Google 드라이브 연결됨" : "연결 안 됨"}</span>
       <span class="v">${esc(email || (drive.signedIn ? "연결됨" : "—"))}</span></div>
+    <div class="srow"><span class="k">로그인 유지</span><span class="v">${connState()}</span></div>
     <div class="srow"><span class="k">마지막 동기화</span><span class="v">${lastSync ? lastSync.toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" }) : "—"}</span></div>
     <div class="srow"><span class="k">저장 위치</span><span class="v">내 드라이브 / ${esc(CONFIG.rootFolder)}</span></div>
     <div class="srow"><span class="k">보관 기간</span><span class="v">${CONFIG.retentionDays}일 지나면 자동 정리</span></div>
     <button class="btn btn-line btn-block" id="s-sync">지금 동기화</button>
+    ${S.mode === "live" && !drive.tokenValid ? '<button class="btn btn-line btn-block" id="s-reconnect">다시 연결</button>' : ""}
     ${S.mode === "live" ? '<button class="btn btn-ghost btn-block" id="s-out">연결 해제</button>' : '<button class="btn btn-ghost btn-block" id="s-login">Google 연결</button>'}
   </div>
 
@@ -1113,6 +1199,7 @@ async function renderSettings() {
   </div>`;
 
   $("#s-sync").addEventListener("click", () => syncNow({ manual: true }));
+  $("#s-reconnect")?.addEventListener("click", reconnect);
   $("#s-out")?.addEventListener("click", () => {
     drive.signOut();
     S.mode = null; S.records = [];

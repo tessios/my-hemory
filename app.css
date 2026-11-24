@@ -255,6 +255,18 @@ input{font:inherit;color:inherit}
 .ab-main span{display:block;font-size:11px;color:rgba(255,255,255,.62);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ab-stop{flex:0 0 auto;font-size:12px;font-weight:600;padding:7px 12px;border-radius:10px;background:rgba(255,255,255,.16);color:#fff}
 
+/* Google 연결이 필요할 때만 나오는 막대 */
+.conn-bar{
+  position:fixed;left:50%;transform:translateX(-50%);width:calc(100% - 24px);max-width:456px;
+  bottom:calc(var(--sb) + 62px);z-index:65;display:flex;align-items:center;gap:9px;
+  padding:10px 14px;background:#111;color:#fff;border-radius:13px;text-align:left;font-size:12px;line-height:1.35;
+  box-shadow:0 10px 26px rgba(0,0,0,.2);animation:fade .25s var(--ease);
+}
+.conn-bar[hidden]{display:none}
+.conn-bar svg{flex:0 0 auto;opacity:.85}
+.conn-bar b{font-weight:600}
+.conn-bar:active{transform:translateX(-50%) scale(.99)}
+
 /* 뒤집어서 녹음 — OLED 절전 오버레이 */
 #sleep-overlay{position:fixed;inset:0;background:#000;z-index:90;display:flex;flex-direction:column;align-items:center;justify-content:center;opacity:0;transition:opacity .4s var(--ease)}
 #sleep-overlay[hidden]{display:none}
