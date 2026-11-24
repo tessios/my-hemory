@@ -67,7 +67,8 @@ DEFAULTS = {
     "diarization": {"method": "auto"},      # auto | pyannote | gemini | none
     "summary": {
         "provider": "auto",                 # auto | api | cli | none
-        "model": "gemini-2.5-flash",
+        "model": "gemini-3.6-flash",
+        "fallback_models": ["gemini-3.6-flash", "gemini-flash-latest"],  # 앞 모델이 404(단종)/503(과부하)이면 차례로 시도
         "api_key_env": "GEMINI_API_KEY",
     },
     "gemini_cli": "gemini",
@@ -259,6 +260,15 @@ class DriveBackend:
         files = j.get("files") or []
         return files[0]["id"] if files else None
 
+    def _find_file(self, name: str, parent: str) -> str | None:
+        """같은 이름의 파일(폴더 제외) id. _find 는 폴더 전용이라 파일에는 쓰지 않는다."""
+        q = f"name = '{name}' and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+        j = self._req("GET", f"{self.API}/files?q={urllib.parse.quote(q)}&fields=files(id,name,parents)&pageSize=20")
+        for f in (j.get("files") or []):
+            if parent in (f.get("parents") or []):
+                return f["id"]
+        return None
+
     def _mkdir(self, name: str, parent: str) -> str:
         body = json.dumps({"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]}).encode()
         j = self._req("POST", f"{self.API}/files?fields=id", body,
@@ -303,7 +313,7 @@ class DriveBackend:
         return out
 
     def has_json(self, folder_id: str, base: str) -> bool:
-        return self._find(f"{base}.json", folder_id) is not None
+        return self._find_file(f"{base}.json", folder_id) is not None
 
     def read_bytes(self, item: dict) -> bytes:
         h = {"Authorization": "Bearer " + self._access_token()}
@@ -324,7 +334,7 @@ class DriveBackend:
     def write_json(self, folder_id: str, name: str, data: dict) -> str:
         blob = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         # 같은 이름이 있으면 내용만 교체
-        old = self._find(name, folder_id)
+        old = self._find_file(name, folder_id)
         if old:
             self._req("PATCH", f"{self.UPLOAD}/files/{old}?uploadType=media", blob,
                       {"Content-Type": "application/json; charset=UTF-8"})
@@ -338,7 +348,7 @@ class DriveBackend:
         return item["id"]
 
     def existing_json(self, folder_id: str, base: str) -> dict | None:
-        fid = self._find(f"{base}.json", folder_id)
+        fid = self._find_file(f"{base}.json", folder_id)
         if not fid:
             return None
         h = {"Authorization": "Bearer " + self._access_token()}
@@ -442,12 +452,26 @@ def gemini_generate(parts: list, cfg: dict, json_mode: bool = False, model: str 
                 "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192}}
         if json_mode:
             body["generationConfig"]["responseMimeType"] = "application/json"
-        req = urllib.request.Request(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{mdl}:generateContent?key={urllib.parse.quote(key)}",
-            data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=600) as r:
-            j = json.loads(r.read())
-        return "".join(p.get("text", "") for p in j["candidates"][0]["content"]["parts"]).strip()
+        # 단종(404)·과부하(503) 모델을 만나면 다음 모델로 넘어간다
+        fallbacks = [m for m in cfg["summary"].get("fallback_models", []) if m and m != mdl]
+        last: Exception | None = None
+        for cand in [mdl] + fallbacks:
+            req = urllib.request.Request(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{cand}:generateContent?key={urllib.parse.quote(key)}",
+                data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    j = json.loads(r.read())
+                return "".join(p.get("text", "") for p in j["candidates"][0]["content"]["parts"]).strip()
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code not in (404, 429, 500, 502, 503, 504):
+                    raise
+                log(f"  · 모델 {cand} 실패({e.code}) → 다음 모델로 재시도")
+            except (TimeoutError, urllib.error.URLError) as e:
+                last = e
+                log(f"  · 모델 {cand} 시간 초과/연결 실패 → 다음 모델로 재시도")
+        raise RuntimeError(f"Gemini 호출 실패: {last}")
 
     # CLI 대체 경로 (gemini CLI 로그인돼 있으면 API 키 없이도 동작)
     if cfg["summary"]["provider"] in ("auto", "cli"):

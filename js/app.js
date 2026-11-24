@@ -1052,7 +1052,7 @@ async function renderSettings() {
     <div class="srow"><span class="k">Gemini API 키</span><span class="v">${hasGemini() ? "설정됨" : "없음"}</span></div>
     <p class="note">키가 있으면 ① 기록에 질문해 답을 만들고 ② 짧은 녹음을 폰에서 바로 전사합니다. 키는 이 기기에만 저장되고 드라이브에 올라가지 않습니다.</p>
     <div class="field"><label>API 키 (AI Studio에서 발급)</label>
-      <input id="s-key" type="password" inputmode="text" autocomplete="off" spellcheck="false" placeholder="AIza..." value="${esc(s.geminiKey || "")}">
+      <input id="s-key" type="password" inputmode="text" autocomplete="off" spellcheck="false" placeholder="AQ... 또는 AIza..." value="${esc(s.geminiKey || "")}">
       <div class="hint">비워 두면 검색·재생만 하고, 전사·요약은 맥이 담당합니다.</div></div>
     <button class="btn btn-line btn-block" id="s-key-save">키 저장</button>
   </div>

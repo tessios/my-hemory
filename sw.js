@@ -1,5 +1,5 @@
 /* Hemory 개인용 서비스 워커 — 앱 껍데기만 캐시. 드라이브/제미나이 응답은 절대 캐시하지 않는다. */
-const VERSION = "hemory-v1.3.0";
+const VERSION = "hemory-v1.3.1";
 const SHELL = [
   "./",
   "./index.html",

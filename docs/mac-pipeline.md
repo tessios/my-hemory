@@ -91,7 +91,7 @@ printf 'export GEMINI_API_KEY="AIza..."\n' > ~/.config/hemory/env && chmod 600 ~
 | `asr.whisper_model` | `small` `medium` `large-v3-turbo` | Apple Silicon: `medium`(정확도·속도 균형), 느리면 `small` |
 | `asr.vad` | `{ "enabled": true, "min_silence_ms": 600, "threshold": 0.5 }` — 침묵 구간을 건너뛰고 말한 구간만 전사 | 기본값 그대로(켜기) 권장 |
 | `diarization.method` | `auto` / `pyannote` / `gemini` / `none` | `auto` |
-| `summary.model` | Gemini 모델 | `gemini-2.5-flash` |
+| `summary.model` | Gemini 모델 | `gemini-3.6-flash` |
 | `retention_days` | 보관 일수 | `365` |
 
 ### 침묵 구간 자동 건너뛰기 (VAD, 기본 켜짐)
@@ -141,7 +141,7 @@ tail -f ~/Library/Logs/hemory-pipeline.log
 |---|---|---|
 | whisper `small` (int8, CPU) | 6~12분 | 0원 |
 | whisper `medium` (int8, CPU) | 15~30분 | 0원 |
-| Gemini `gemini-2.5-flash` (Files API) | 1~3분 | 오디오 분당 과금(무료 한도 내면 0원) |
+| Gemini `gemini-3.6-flash` (Files API) | 1~3분 | 오디오 분당 과금(무료 한도 내면 0원) |
 
 `diarization: gemini` 는 전사문 텍스트만 보내므로 추가 비용이 작습니다. `pyannote` 는 정확하지만 HuggingFace 토큰과 모델 다운로드(~1GB)가 필요합니다.
 

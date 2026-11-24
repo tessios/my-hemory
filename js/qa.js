@@ -8,9 +8,10 @@ function key() {
 }
 export const hasGemini = () => !!key();
 
-async function generate({ parts, model = CONFIG.geminiModel, json = false, temperature = 0.2, apiKey }) {
-  const k = apiKey || key();
-  if (!k) throw new Error("Gemini API 키가 설정되지 않았습니다.");
+// 앞 모델이 단종(404)·과부하(503)이면 차례로 시도
+const FALLBACK_MODELS = ["gemini-3.6-flash", "gemini-flash-latest"];
+
+async function once(model, { parts, json, temperature, k }) {
   const body = {
     contents: [{ role: "user", parts }],
     generationConfig: { temperature, maxOutputTokens: 4096 },
@@ -25,12 +26,31 @@ async function generate({ parts, model = CONFIG.geminiModel, json = false, tempe
   if (!res.ok) {
     let m = `Gemini ${res.status}`;
     try { const j = await res.json(); m = j.error?.message || m; } catch {}
-    throw new Error(m);
+    const err = new Error(m);
+    err.status = res.status;
+    throw err;
   }
   const j = await res.json();
   const text = (j.candidates?.[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
   if (!text) throw new Error("응답이 비어 있습니다.");
   return text;
+}
+
+async function generate({ parts, model = CONFIG.geminiModel, json = false, temperature = 0.2, apiKey }) {
+  const k = apiKey || key();
+  if (!k) throw new Error("Gemini API 키가 설정되지 않았습니다.");
+  const models = [model, ...FALLBACK_MODELS.filter((m) => m !== model)];
+  let last = null;
+  for (const mdl of models) {
+    try {
+      return await once(mdl, { parts, json, temperature, k });
+    } catch (e) {
+      const retryable = [404, 429, 500, 502, 503, 504].includes(e.status);
+      if (!retryable) throw e;
+      last = e;
+    }
+  }
+  throw last;
 }
 
 /* ── Q&A ─────────────────────────────────────────── */

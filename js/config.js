@@ -4,7 +4,7 @@
    (2026-11-24: 개인 모드 프로젝트 personal-mode-app 의 "Hemory Web (personal)" 클라이언트 — 공개 식별자라 저장소에 넣어도 안전)
    비워 두면 앱 첫 화면의 "처음 설정"에서 직접 입력할 수 있습니다(폰에만 저장). */
 export const CONFIG = {
-  version: "1.3.0",
+  version: "1.3.1",
   clientId: "746533653611-s8keromh27u55lptk5l05guldvhiq7lo.apps.googleusercontent.com",
   rootFolder: "Hemory-개인녹음",       // 내 드라이브 안의 전용 폴더
   inboxFolder: "_inbox",             // 아이폰 음성메모·단축어가 올리는 곳
@@ -12,7 +12,7 @@ export const CONFIG = {
   scopes: "https://www.googleapis.com/auth/drive",
   driveApi: "https://www.googleapis.com/drive/v3",
   uploadApi: "https://www.googleapis.com/upload/drive/v3",
-  geminiModel: "gemini-2.5-flash",
+  geminiModel: "gemini-3.6-flash",   // 2026-11-24: 2.5-flash는 신규 키에서 404(더 이상 제공 안 함) → 3.6-flash로 교체
   retentionDays: 365,
 };
 
