@@ -229,7 +229,7 @@ function updateSleepOverlay() {
 function renderFlipChip() {
   const el = $("#flip-chip");
   if (!el) return;
-  const show = S.mode === "live" && !S.auto.on && (faceDownPref() || flip.state === "active");
+  const show = S.mode === "live" && S.tab !== "settings" && !S.auto.on && (faceDownPref() || flip.state === "active");
   el.hidden = !show;
   if (!show) return;
   el.dataset.state = flip.state;
@@ -470,10 +470,11 @@ function setTab(tab) {
   $$("#tabbar button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   showScreen(tab);
   $("#fab").hidden = tab !== "timeline";
-  if (tab === "timeline") { renderTimeline(); renderFlipChip(); }
+  if (tab === "timeline") renderTimeline();
   if (tab === "search") { renderSearch(); setTimeout(() => $("#q").focus(), 120); }
   if (tab === "settings") renderSettings();
   else if (typeof flip !== "undefined") flip.setProbe(false);
+  renderFlipChip();
 }
 
 /* ────────────────────────────────── 모드 ── */
