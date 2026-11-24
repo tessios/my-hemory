@@ -124,6 +124,7 @@ async function enterDemo() {
   reindex();
   showChrome();
   setTab("timeline");
+  applyDeepLink();
   toast("데모 데이터입니다 · 실제 저장은 되지 않습니다", 3000);
 }
 
@@ -143,7 +144,15 @@ async function enterLive() {
     $("#tl-list").innerHTML = '<div class="loading"><span class="spinner dark"></span></div>';
   }
   setTab("timeline");
+  applyDeepLink();
   syncNow();
+}
+
+/* 매니페스트 바로가기(?tab=search, ?action=record) */
+function applyDeepLink() {
+  const p = new URLSearchParams(location.search);
+  if (p.get("tab") === "search") setTab("search");
+  if (p.get("action") === "record") setTimeout(openRecorder, 500);
 }
 
 function showChrome() {
