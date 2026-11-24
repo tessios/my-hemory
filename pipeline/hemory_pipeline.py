@@ -364,7 +364,28 @@ def folder_of(be, name: str):
 _WHISPER: dict = {}
 
 
+def _patch_pyav_compat() -> None:
+    """PyAV 19 부터 av.open(metadata_errors=...) 인자가 없어졌는데
+    faster-whisper 1.2.x 가 그 인자를 넘겨 전사가 TypeError 로 죽습니다.
+    넘겨받은 인자만 조용히 걸러 호환시킵니다(다른 동작은 그대로)."""
+    try:
+        import av  # type: ignore
+    except Exception:
+        return
+    if getattr(av.open, "_hemory_compat", False):
+        return
+    _orig_open = av.open
+
+    def _open_compat(*args, **kwargs):
+        kwargs.pop("metadata_errors", None)
+        return _orig_open(*args, **kwargs)
+
+    _open_compat._hemory_compat = True  # type: ignore[attr-defined]
+    av.open = _open_compat  # type: ignore[assignment]
+
+
 def transcribe_whisper(path_or_bytes, cfg: dict, name: str = "audio") -> dict:
+    _patch_pyav_compat()
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except ImportError:
