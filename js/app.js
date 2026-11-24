@@ -1370,19 +1370,26 @@ async function renderSettings() {
       return;
     }
     const r = await flip.enable();
-    if (r.ok) { prewarmMic(); unlockAudio(); }
-    setFaceDown(r.ok);
+    const usable = r.ok || r.reason === "timeout" || r.reason === "unknown";
+    if (usable) { prewarmMic(); unlockAudio(); }
+    setFaceDown(usable);
     renderSettings();
-    toast(r.ok
-      ? "뒤집어 녹음을 켰습니다 · 앱을 켜 둔 채 폰을 엎어 보세요"
-      : "센서 권한이 필요합니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
+    toast(
+      r.ok ? "뒤집어 녹음을 켰습니다 · 앱을 켜 둔 채 폰을 엎어 보세요"
+        : usable ? "켰습니다 · 권한 확인이 늦어지고 있어요(상태를 확인해 주세요)"
+        : r.reason === "unsupported" ? "이 브라우저는 센서를 지원하지 않습니다"
+        : "센서 권한이 거부되었습니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
   });
   $("#s-flip-perm")?.addEventListener("click", async () => {
     const r = await flip.requestPermission();
-    if (r.ok) { prewarmMic(); unlockAudio(); }
-    flip.setArmed(faceDownPref());
+    if (r.ok || r.reason === "timeout" || r.reason === "unknown") { prewarmMic(); unlockAudio(); }
+    flip.setArmed(faceDownPref() || r.ok);
+    if (r.ok && !faceDownPref()) setFaceDown(true);
     renderSettings();
-    toast(r.ok ? "센서 권한을 허용했습니다" : "권한이 거부되었습니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
+    toast(
+      r.ok ? "센서 권한을 허용했습니다"
+        : r.reason === "timeout" || r.reason === "unknown" ? "권한 창이 응답하지 않았습니다 · 한 번 더 눌러 주세요"
+        : "권한이 거부되었습니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
   });
 
   flip.setProbe(true);          // 설정 화면에서는 녹음 없이 센서 값만 보여 준다
@@ -1549,9 +1556,10 @@ function openRecorder() {
     }
     faceBtn.disabled = true;
     const r = await flip.enable();            // 탭 안에서 곧바로 센서 권한 요청
-    if (r.ok) { prewarmMic(); unlockAudio(); } // 마이크·오디오도 미리 열어 둔다(제스처가 있을 때)
+    const usable = r.ok || r.reason === "timeout" || r.reason === "unknown";
+    if (usable) { prewarmMic(); unlockAudio(); } // 마이크·오디오도 미리 열어 둔다(제스처가 있을 때)
     faceBtn.disabled = false;
-    if (!r.ok) {
+    if (!usable) {
       return toast(r.reason === "unsupported" ? "이 브라우저는 센서를 지원하지 않습니다" : "아이폰 설정 → 앱 → 동작 및 방향 접근을 허용해야 쓸 수 있습니다");
     }
     faceOn = true;

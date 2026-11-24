@@ -95,17 +95,32 @@ export class FlipWatcher {
 
     this.askedThisLoad = true;
     const ask = async (Ctor) => {
-      try { return await Ctor.requestPermission(); } catch (e) { return "error:" + (e?.name || "error"); }
+      try {
+        const p = Ctor.requestPermission();
+        if (!p || typeof p.then !== "function") return typeof p === "string" ? p : "error";
+        // 권한 창이 응답하지 않는 브라우저도 있어서 기다림에 한도를 둔다
+        return await Promise.race([
+          p.then((v) => (typeof v === "string" ? v : "error")).catch((e) => "error:" + (e?.name || "error")),
+          new Promise((r) => setTimeout(() => r("timeout"), 8000)),
+        ]);
+      } catch (e) { return "error:" + (e?.name || "error"); }
     };
     const detail = {};
     if (typeof window.DeviceMotionEvent?.requestPermission === "function") detail.motion = await ask(window.DeviceMotionEvent);
     if (typeof window.DeviceOrientationEvent?.requestPermission === "function") detail.orientation = await ask(window.DeviceOrientationEvent);
     this.permDetail = detail;
-    const ok = Object.values(detail).includes("granted");
-    this.perm = ok ? "granted" : "denied";
-    if (ok) this.start();
+    const vals = Object.values(detail);
+    const granted = vals.includes("granted");
+    const denied = vals.includes("denied") || vals.some((v) => String(v).startsWith("error:NotAllowed"));
+    this.perm = granted ? "granted" : denied ? "denied" : "unknown";
+    // 응답이 없어도 감시는 켠다 — 이벤트가 들어오면 아래 _absorb* 에서 허용됨으로 올린다
+    if (!denied) this.start();
     this._sync();
-    return { ok, detail };
+    return {
+      ok: granted,
+      reason: granted ? "granted" : denied ? "denied" : vals.includes("timeout") ? "timeout" : "unknown",
+      detail,
+    };
   }
 
   /* 스위치를 켤 때: 권한 → 감시 시작. (마이크 예열은 호출한 쪽에서) */
@@ -182,6 +197,7 @@ export class FlipWatcher {
     if (a && typeof a.z === "number" && Number.isFinite(a.z)) {
       this.last.gz = a.z;
       this.last.t = Date.now();
+      if (this.perm === "unknown") { this.perm = "granted"; this._sync(); }
     }
   }
 
@@ -189,6 +205,7 @@ export class FlipWatcher {
     if (typeof e.beta === "number" && Number.isFinite(e.beta)) {
       this.last.beta = e.beta;
       if (!this.last.t) this.last.t = Date.now();
+      if (this.perm === "unknown") { this.perm = "granted"; this._sync(); }
     }
   }
 
