@@ -68,9 +68,19 @@ printf 'export GEMINI_API_KEY="AIza..."\n' > ~/.config/hemory/env && chmod 600 ~
 | `local_root` | A 방식 경로 | 위 경로 |
 | `asr.engine` | `auto` / `whisper` / `gemini` | `auto`(whisper 있으면 whisper) |
 | `asr.whisper_model` | `small` `medium` `large-v3-turbo` | Apple Silicon: `medium`(정확도·속도 균형), 느리면 `small` |
+| `asr.vad` | `{ "enabled": true, "min_silence_ms": 600, "threshold": 0.5 }` — 침묵 구간을 건너뛰고 말한 구간만 전사 | 기본값 그대로(켜기) 권장 |
 | `diarization.method` | `auto` / `pyannote` / `gemini` / `none` | `auto` |
 | `summary.model` | Gemini 모델 | `gemini-2.5-flash` |
 | `retention_days` | 보관 일수 | `365` |
+
+### 침묵 구간 자동 건너뛰기 (VAD, 기본 켜짐)
+
+`faster-whisper` 로 전사할 때 `vad_filter=True` 가 기본으로 걸려, 말이 없는 구간은 전사에서 빼고 실제 말한 구간만 처리합니다. 기본값은 `min_silence_ms: 600`(0.6초 넘게 조용하면 그 구간을 건너뜀)입니다.
+
+- 더 긴 침묵만 건너뛰고 싶으면 `min_silence_ms` 를 올립니다(예: `1000`).
+- 조용한 회의실에서 말끝이 잘리면 `threshold` 를 낮춥니다(0.5 → 0.35).
+- 전사를 그대로(무음 포함) 받고 싶으면 `"enabled": false`.
+- 이 설정은 `asr.engine: gemini` 에는 적용되지 않습니다(제미나이는 파일 전체를 보고 전사).
 
 ## 4. 첫 실행
 

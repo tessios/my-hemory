@@ -61,6 +61,8 @@ DEFAULTS = {
         "whisper_device": "cpu",
         "whisper_compute": "int8",
         "language": "ko",
+        # VAD(음성 구간 검지): 침묵 구간을 건너뛰고 실제 말한 구간만 전사한다
+        "vad": {"enabled": True, "min_silence_ms": 600, "threshold": 0.5},
     },
     "diarization": {"method": "auto"},      # auto | pyannote | gemini | none
     "summary": {
@@ -376,6 +378,13 @@ def transcribe_whisper(path_or_bytes, cfg: dict, name: str = "audio") -> dict:
         _WHISPER["model"] = WhisperModel(a["whisper_model"], device=a["whisper_device"], compute_type=a["whisper_compute"])
         _WHISPER["key"] = key
     model = _WHISPER["model"]
+    vad_cfg = a.get("vad") or {}
+    vad_on = bool(vad_cfg.get("enabled", True))
+    vad_params = None
+    if vad_on:
+        vad_params = {"min_silence_duration_ms": int(vad_cfg.get("min_silence_ms", 600))}
+        if vad_cfg.get("threshold") is not None:
+            vad_params["threshold"] = float(vad_cfg["threshold"])
     if isinstance(path_or_bytes, (bytes, bytearray)):
         tmp = STATE_DIR / "tmp" / name
         tmp.parent.mkdir(parents=True, exist_ok=True)
@@ -387,8 +396,8 @@ def transcribe_whisper(path_or_bytes, cfg: dict, name: str = "audio") -> dict:
     segments, info = model.transcribe(
         src,
         language=a.get("language") or None,
-        vad_filter=True,
-        vad_parameters={"min_silence_duration_ms": 500},
+        vad_filter=vad_on,
+        vad_parameters=vad_params,
         beam_size=5,
         condition_on_previous_text=False,
     )
@@ -400,7 +409,8 @@ def transcribe_whisper(path_or_bytes, cfg: dict, name: str = "audio") -> dict:
         segs.append({"i": len(segs), "start": round(float(s.start), 2), "end": round(float(s.end), 2),
                      "speaker": "", "text": text})
     return {"segments": segs, "language": getattr(info, "language", None) or a.get("language") or "ko",
-            "engine": {"asr": f"faster-whisper/{a['whisper_model']}", "device": a["whisper_device"]}}
+            "engine": {"asr": f"faster-whisper/{a['whisper_model']}", "device": a["whisper_device"],
+                       "vad": vad_on}}
 
 
 def gemini_generate(parts: list, cfg: dict, json_mode: bool = False, model: str | None = None) -> str:

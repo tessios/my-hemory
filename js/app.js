@@ -23,7 +23,187 @@ const S = {
   player: null,
   recorder: new Recorder(),
   recordingSheet: null,
+  sheet: null,
+  auto: { on: false, pending: false, failAt: 0, startedAt: 0, type: "work", timer: null, gestureBound: false },
 };
+
+/* ── 예약 녹음(요일·시간) ─────────────────────────────── */
+const DAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+const DAY_LABELS = ["일", "월", "화", "수", "목", "금", "토"];
+
+function defaultSchedule() {
+  const day = (on) => ({ on, start: on ? "09:00" : "10:00", end: on ? "18:00" : "18:00" });
+  const days = {};
+  for (const k of DAY_KEYS) days[k] = day(k !== "sun" && k !== "sat");
+  return { enabled: false, type: "work", days };
+}
+
+function getSchedule() {
+  const base = defaultSchedule();
+  const saved = localSettings().schedule || {};
+  const out = { enabled: !!saved.enabled, type: saved.type || base.type, days: { ...base.days } };
+  for (const k of DAY_KEYS) {
+    const d = saved.days?.[k];
+    if (!d) continue;
+    out.days[k] = {
+      on: !!d.on,
+      start: /^\d{1,2}:\d{2}$/.test(d.start || "") ? d.start : base.days[k].start,
+      end: /^\d{1,2}:\d{2}$/.test(d.end || "") ? d.end : base.days[k].end,
+    };
+  }
+  return out;
+}
+
+function saveSchedule(patch) {
+  const next = { ...getSchedule(), ...patch };
+  saveSettings({ schedule: next });
+  return next;
+}
+
+function mins(hhmm) {
+  const [h, m] = String(hhmm || "0:0").split(":").map((x) => parseInt(x, 10) || 0);
+  return h * 60 + m;
+}
+
+/* 자정을 넘기는 구간(22:00~06:00)도 처리 */
+function inWindow(now, d) {
+  if (!d?.on) return false;
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const a = mins(d.start), b = mins(d.end);
+  if (a === b) return false;
+  return a < b ? cur >= a && cur < b : cur >= a || cur < b;
+}
+
+function scheduleActiveNow(now = new Date()) {
+  const sch = getSchedule();
+  if (!sch.enabled) return null;
+  const d = sch.days[DAY_KEYS[now.getDay()]];
+  return inWindow(now, d) ? d : null;
+}
+
+/* 녹음 상태가 바뀔 때마다 화면 조각들을 다시 그린다 */
+const recListeners = new Set();
+function recStatus() {
+  for (const fn of recListeners) { try { fn(); } catch (e) { console.warn(e); } }
+}
+function addRecListener(fn) { recListeners.add(fn); return fn; }
+function delRecListener(fn) { recListeners.delete(fn); }
+
+/* ── 뒤집어서 자동 녹음(Face-Down) ───────────────────── */
+const FACE = { beta: 145, up: 130, holdMs: 1500 };
+S.face = { watcherOn: false, armed: false, downSince: 0, active: false, startedAt: 0, timer: null };
+
+function faceDownPref() { return localSettings().faceDown === true; }
+
+async function askMotionPermission() {
+  const DOE = window.DeviceOrientationEvent;
+  if (!DOE) return false;
+  if (typeof DOE.requestPermission === "function") {
+    try { return (await DOE.requestPermission()) === "granted"; } catch { return false; }
+  }
+  return true;
+}
+
+function startFaceWatcher() {
+  if (S.face.watcherOn || !window.DeviceOrientationEvent) return;
+  S.face.watcherOn = true;
+  window.addEventListener("deviceorientation", onOrient, true);
+}
+
+function stopFaceWatcher() {
+  if (!S.face.watcherOn) return;
+  S.face.watcherOn = false;
+  S.face.downSince = 0;
+  window.removeEventListener("deviceorientation", onOrient, true);
+}
+
+function armFacePermission() {
+  if (S.face.armed) return;
+  S.face.armed = true;
+  const once = async () => {
+    document.removeEventListener("pointerdown", once, true);
+    document.removeEventListener("keydown", once, true);
+    S.face.armed = false;
+    if (!faceDownPref()) return;
+    if (await askMotionPermission()) startFaceWatcher();
+  };
+  document.addEventListener("pointerdown", once, true);
+  document.addEventListener("keydown", once, true);
+}
+
+function onOrient(e) {
+  if (e.beta == null) return;
+  const b = Math.abs(e.beta);
+  const now = Date.now();
+  if (b > FACE.beta) {
+    if (!S.face.downSince) S.face.downSince = now;
+    if (!S.face.active && !S.auto.on && S.recorder.state === "idle" && now - S.face.downSince >= FACE.holdMs) {
+      startFaceRecording();
+    }
+  } else {
+    S.face.downSince = 0;
+    if (S.face.active && b < FACE.up) stopFaceRecording();
+  }
+}
+
+async function startFaceRecording() {
+  if (S.mode !== "live" || S.face.active) return;
+  if (S.recorder.state !== "idle") return;
+  try {
+    await S.recorder.start({ vad: localSettings().vad !== false });
+  } catch (e) {
+    console.warn("face start", e);
+    toast("엎어 녹음을 시작하려면 앱을 한 번 탭해 주세요");
+    return;
+  }
+  S.face.active = true;
+  S.face.startedAt = Date.now();
+  haptic(16);
+  showSleepOverlay();
+  clearInterval(S.face.timer);
+  S.face.timer = setInterval(updateSleepOverlay, 1000);
+}
+
+async function stopFaceRecording(save = true) {
+  if (!S.face.active) return;
+  S.face.active = false;
+  clearInterval(S.face.timer);
+  S.face.timer = null;
+  hideSleepOverlay();
+  const out = await S.recorder.stop();
+  if (!save || !out || !out.blob?.size) return;
+  const title = `뒤집어 녹음 ${fmtTime(new Date().toISOString())}`;
+  try {
+    await saveRecordingFast({ blob: out.blob, duration: out.duration, mime: out.mime, title, type: "work", speechSec: out.speechSec });
+    haptic([10, 40, 10]);
+    toast("녹음을 저장했습니다");
+  } catch (e) {
+    toast("기기에 보관했습니다 · 연결되면 올라갑니다");
+  }
+}
+
+function showSleepOverlay() {
+  const el = $("#sleep-overlay");
+  if (!el) return;
+  el.hidden = false;
+  requestAnimationFrame(() => el.classList.add("show"));
+  updateSleepOverlay();
+}
+
+function hideSleepOverlay() {
+  const el = $("#sleep-overlay");
+  if (!el) return;
+  el.classList.remove("show");
+  el.hidden = true;
+}
+
+function updateSleepOverlay() {
+  const el = $("#sleep-overlay");
+  if (!el || el.hidden) return;
+  const t = $("#so-time", el);
+  if (t) t.textContent = fmtClock((Date.now() - S.face.startedAt) / 1000);
+}
+
 
 /* ────────────────────────────────── 시작 ── */
 async function boot() {
@@ -84,6 +264,30 @@ function bindGlobal() {
   window.addEventListener("online", () => { if (S.mode === "live") syncNow(); });
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
+
+  /* 녹음 상태 → 화면 조각들 */
+  S.recorder.onStatus = recStatus;
+  addRecListener(renderAutoBar);
+  addRecListener(updateSleepOverlay);
+
+  /* 화면이 가려지기 전까지 모인 소리는 잃지 않게 저장 */
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") rescueRecording("hidden");
+    else { schedTick(); renderAutoBar(); }
+  });
+  window.addEventListener("pagehide", () => { rescueRecording("pagehide"); });
+
+  /* 절전 오버레이를 탭하면 바로 종료·저장 */
+  $("#sleep-overlay")?.addEventListener("click", () => {
+    if (S.face.active) stopFaceRecording(true);
+  });
+
+  /* 예열: 예약 녹음 20초마다 확인, 뒤집어 녹음은 첫 탭에서 동작 권한 */
+  setInterval(schedTick, 20000);
+  if (faceDownPref()) {
+    startFaceWatcher();
+    armFacePermission();
   }
 }
 
@@ -823,6 +1027,13 @@ async function renderSettings() {
   const lastSync = S.lastSync ? new Date(S.lastSync) : null;
   const email = localStorage.getItem("hemory.email") || "";
   const standalone = matchMedia("(display-mode: standalone)").matches || navigator.standalone;
+  const sch = getSchedule();
+  const _now = new Date();
+  const schedNow = {
+    d: DAY_LABELS[_now.getDay()],
+    hm: `${String(_now.getHours()).padStart(2, "0")}:${String(_now.getMinutes()).padStart(2, "0")}`,
+    inside: !!scheduleActiveNow(_now),
+  };
 
   body.innerHTML = `
   <div class="sgroup">
@@ -861,6 +1072,30 @@ async function renderSettings() {
     <p class="note">① Safari로 이 페이지를 연 뒤 <b>공유 → 홈 화면에 추가</b>하면 주소창 없는 앱처럼 열립니다.<br>
     ② 화면이 꺼져도 계속 녹음하려면 <b>음성 메모</b>로 녹음한 뒤 공유 → <b>Google 드라이브</b> → <b>${esc(CONFIG.rootFolder)} / ${esc(CONFIG.inboxFolder)}</b>에 저장하세요. 맥이 자동으로 전사합니다.<br>
     ③ 짧은 메모는 이 앱의 녹음 버튼으로 바로 남길 수 있습니다.</p>
+    <button class="btn btn-line btn-block" id="s-guide">아이폰 단축어 가이드 보기</button>
+  </div>
+
+  <div class="sgroup">
+    <h2>예약 녹음</h2>
+    <div class="srow"><span class="k">예약 녹음 모드</span>
+      <button class="sw" id="s-sch-on" role="switch" aria-checked="${sch.enabled ? "true" : "false"}" aria-label="예약 녹음 모드"><i></i></button></div>
+    <p class="note">앱이 열려 있을 때, 정한 요일·시간이 되면 <b>자동으로 녹음을 시작</b>하고 끝나는 시각에 <b>자동 저장</b>합니다. 화면 꺼짐 방지·침묵 건너뛰기도 함께 켜집니다. 종일 녹음은 충전기에 꼽아 두세요.</p>
+    <div class="chips" style="padding:0 0 6px">
+      ${Object.entries(TYPES).map(([k, v]) => `<button class="chip ${sch.type === k ? "on" : ""}" data-stype="${k}">${v.label}</button>`).join("")}
+    </div>
+    <div class="sch">
+      ${DAY_KEYS.map((k, i) => {
+        const d = sch.days[k];
+        return `<div class="sch-row">
+          <button class="sch-day ${d.on ? "on" : ""}" data-day="${k}" aria-pressed="${d.on}" aria-label="${DAY_LABELS[i]}요일 ${d.on ? "켜짐" : "꺼짐"}">${DAY_LABELS[i]}</button>
+          <input type="time" data-day="${k}" data-k="start" value="${d.start}" step="60" aria-label="${DAY_LABELS[i]} 시작 시간"${d.on ? "" : " disabled"}>
+          <span class="sch-dash">~</span>
+          <input type="time" data-day="${k}" data-k="end" value="${d.end}" step="60" aria-label="${DAY_LABELS[i]} 종료 시간"${d.on ? "" : " disabled"}>
+        </div>`;
+      }).join("")}
+    </div>
+    <div class="sch-hint"><span>지금 ${schedNow.d}요일 ${schedNow.hm} · ${schedNow.inside ? "녹음 시간 안" : "녹음 시간 밖"}</span></div>
+    <p class="note">월~일 각각 켜고 끄고, 자정을 넘기는 구간(예: 22:00~06:00)도 됩니다. 아이폰은 앱을 한 번 탭해야 마이크가 열리므로, 자동 시작이 막히면 화면을 한 번 탭해 주세요.</p>
   </div>
 
   <div class="sgroup">
@@ -905,6 +1140,75 @@ async function renderSettings() {
     toast("이 기기 캐시를 비웠습니다");
   });
   $("#s-demo-exit")?.addEventListener("click", () => { S.mode = null; S.records = []; location.reload(); });
+  $("#s-guide")?.addEventListener("click", openShortcutGuide);
+
+  /* 예약 녹음 */
+  $("#s-sch-on").addEventListener("click", () => {
+    const next = saveSchedule({ enabled: !getSchedule().enabled });
+    renderSettings();
+    toast(next.enabled ? "예약 녹음 모드를 켰습니다" : "예약 녹음 모드를 껐습니다");
+    schedTick();
+  });
+  $$("#settings-body .sch-day").forEach((btn) => btn.addEventListener("click", () => {
+    const k = btn.dataset.day;
+    const cur = getSchedule();
+    const days = { ...cur.days, [k]: { ...cur.days[k], on: !cur.days[k].on } };
+    saveSchedule({ days });
+    renderSettings();
+    schedTick();
+  }));
+  $$("#settings-body .sch-row input[type=time]").forEach((inp) => inp.addEventListener("change", () => {
+    const k = inp.dataset.day, field = inp.dataset.k, val = inp.value;
+    if (!/^\d{2}:\d{2}$/.test(val)) return toast("시간을 다시 확인해 주세요");
+    const cur = getSchedule();
+    const days = { ...cur.days, [k]: { ...cur.days[k], [field]: val } };
+    saveSchedule({ days });
+    toast("예약 시간을 저장했습니다");
+    schedTick();
+  }));
+  $$("#settings-body [data-stype]").forEach((b) => b.addEventListener("click", () => {
+    saveSchedule({ type: b.dataset.stype });
+    renderSettings();
+  }));
+}
+
+/* ────────────────────────────────── 아이폰 단축어 가이드 ── */
+function openShortcutGuide() {
+  const inbox = `${CONFIG.rootFolder} / ${CONFIG.inboxFolder}`;
+  openSheet({
+    title: "아이폰 단축어 가이드",
+    sub: "한 번만 만들면 음성 메모가 바로 드라이브로",
+    body: `<div style="padding:2px 2px 0">
+      <div class="guide-block">
+        <h3>① 음성 메모 → 드라이브 원탭 업로드</h3>
+        <div class="guide-step"><b>1</b><span>단축어 앱 → 오른쪽 위 <b>+</b> → 이름을 <b>Hemory에 저장</b>으로.</span></div>
+        <div class="guide-step"><b>2</b><span>아래 검색창에서 <b>파일 저장</b>(Save File) 액션 추가.</span></div>
+        <div class="guide-step"><b>3</b><span>액션의 <b>서비스 위치</b>에서 <b>Google 드라이브</b> → 경로 <b>${esc(inbox)}</b> 선택.</span></div>
+        <div class="guide-step"><b>4</b><span>입력은 <b>단축어 입력</b> 그대로 두고, <b>덮어쓰기 확인</b>은 끄기.</span></div>
+        <div class="guide-step"><b>5</b><span>(선택) 단축어 수정 화면 → 공유 → <b>홈 화면에 추가</b>.</span></div>
+        <div class="guide-step"><b>6</b><span>음성 메모 앱 → 녹음 선택 → <b>공유</b> → 목록을 넘겨 <b>Hemory에 저장</b> 탭. 자주 쓰면 공유 시트에서 위로 올려 두세요.</span></div>
+        <p class="note" style="margin:10px 0 0">저장된 파일은 맥이 다음 실행에 전사·요약해 달별 폴더로 옮깁니다.</p>
+      </div>
+
+      <div class="guide-block">
+        <h3>② 정한 요일·시간에 자동 알림(또는 앱 열기)</h3>
+        <div class="guide-step"><b>1</b><span>단축어 앱 → 하단 <b>자동화</b> → <b>+</b> → <b>특정 시간</b>.</span></div>
+        <div class="guide-step"><b>2</b><span>시간(예: 09:00), 반복은 <b>매일</b> 또는 요일 지정에서 필요한 요일만.</span></div>
+        <div class="guide-step"><b>3</b><span>동작: <b>알림 표시</b>(놓치지 않게) 또는 <b>앱 열기 → 음성 메모</b>(바로 녹음 화면).</span></div>
+        <div class="guide-step"><b>4</b><span><b>실행 전 확인</b>을 끄면 잠금을 풀지 않아도 알림이 뜨고, 켜면 실행 전에 한 번 물어봅니다.</span></div>
+        <p class="note" style="margin:10px 0 0">이 앱으로 받으려면 자동화의 앱 열기를 <b>Hemory 홈 화면 앱</b>으로 두고, 설정 → <b>예약 녹음</b>에서 요일·시간을 켜 두세요. 앱이 열린 상태에서 영역 안이면 자동으로 녹음을 시작합니다.</p>
+      </div>
+
+      <div class="guide-block">
+        <h3>③ 동작 버튼에 음성 메모 달기</h3>
+        <div class="guide-step"><b>1</b><span>설정 → <b>동작 버튼</b> → 옆으로 넘겨 <b>음성 메모</b> 선택.</span></div>
+        <div class="guide-step"><b>2</b><span>이제 버튼을 길게 누르면 녹음이 바로 시작됩니다. (카메라·손전등 등 기존 기능은 다른 걸로 바꿀 수 있습니다)</span></div>
+        <p class="note" style="margin:10px 0 0">동작 버튼에서 음성 메모가 보이지 않으면 설정 → 동작 버튼 → <b>단축어</b>를 고르고 ①에서 만든 단축어를 연결해도 됩니다.</p>
+      </div>
+
+      <p class="note">더 자세한 내용은 저장소 <b>docs/iphone.md</b> 에도 있습니다.</p>
+    </div>`,
+  });
 }
 
 function openSetupSheet() {
@@ -940,8 +1244,15 @@ function openSetupSheet() {
 /* ────────────────────────────────── 녹음 ── */
 function openRecorder() {
   const R = S.recorder;
+  if (S.auto.on || S.face.active) {
+    return toast("예약·뒤집어 녹음이 진행 중입니다. 먼저 종료해 주세요");
+  }
   if (R.state !== "idle" && R.state !== "done") { R.cancel(); }
   let saved = null;
+  let vad = localSettings().vad !== false; // 기본 ON
+  let faceOn = faceDownPref();
+  const wakeOK = Recorder.wakeSupported;
+  const vadOK = Recorder.vadSupported;
 
   const sheet = openSheet({
     title: "녹음",
@@ -949,17 +1260,31 @@ function openRecorder() {
     body: `<div class="rec-wrap">
       <div class="rec-timer" id="rec-timer">00:00</div>
       <div class="rec-state" id="rec-state">대기 중</div>
+      <div class="rec-badges" id="rec-badges"></div>
       <div class="wave" id="rec-wave">${Array.from({ length: 32 }, () => '<i></i>').join("")}</div>
       <div class="rec-controls" id="rec-controls">
         <button class="rec-side" id="rec-file" title="파일 가져오기" aria-label="파일 가져오기">파일</button>
         <button class="rec-main" id="rec-main">시작</button>
         <button class="rec-side" id="rec-pause" title="일시정지" aria-label="일시정지" disabled>일시</button>
       </div>
+      <div class="rec-opt">
+        <div class="rec-opt-txt"><b>침묵 구간 자동 건너뛰기</b>
+          <span>${vadOK ? "말하지 않는 동안은 소리를 담지 않고, 전사도 말한 구간만 합니다 (VAD)" : "이 브라우저에서는 사용할 수 없습니다"}</span></div>
+        <button class="sw" id="rec-vad" role="switch" aria-checked="${vad && vadOK ? "true" : "false"}" aria-label="침묵 구간 자동 건너뛰기"${vadOK ? "" : " disabled"}><i></i></button>
+      </div>
+      <div class="rec-opt">
+        <div class="rec-opt-txt"><b>뒤집어서 자동 녹음</b>
+          <span>폰을 엎어 두면 1.5초 뒤 녹음이 시작되고 화면은 검게 절전합니다. 다시 들면 자동 저장</span></div>
+        <button class="sw" id="rec-face" role="switch" aria-checked="${faceOn ? "true" : "false"}" aria-label="뒤집어서 자동 녹음"${window.DeviceOrientationEvent ? "" : " disabled"}><i></i></button>
+      </div>
       <div id="rec-save-area"></div>
-      <div class="rec-note">화면이 꺼지거나 전화가 오면 Safari 녹음은 멈춥니다. 긴 회의·강의는 <b>아이폰 음성 메모</b>로 녹음해 공유 → Google 드라이브 → <b>${esc(CONFIG.inboxFolder)}</b>에 저장하면 맥이 전사합니다.</div>
+      <div class="rec-note" id="rec-note">${wakeOK
+        ? "녹음 중에는 화면이 저절로 꺼지지 않도록 화면 잠금을 걸어 둡니다(iOS 16.4+). 다만 직접 화면을 잠그거나 전화가 오면 Safari가 마이크를 끊습니다 — 종일 녹음은 충전기에 꽂고 화면을 켜 둔 채 쓰세요."
+        : "이 브라우저는 녹음 중 화면 꺼짐 방지를 지원하지 않습니다(iOS 16.4+ Safari 필요). 화면이 꺼지거나 전화가 오면 녹음이 멈춥니다. 긴 회의·강의는 <b>아이폰 음성 메모</b>로 녹음해 공유 → Google 드라이브 → <b>" + esc(CONFIG.inboxFolder) + "</b>에 저장하면 맥이 전사합니다."}</div>
     </div>`,
     tall: false,
   });
+  sheet._rec = true;
 
   const timerEl = $("#rec-timer", sheet);
   const stateEl = $("#rec-state", sheet);
@@ -968,7 +1293,55 @@ function openRecorder() {
   const pauseBtn = $("#rec-pause", sheet);
   const fileBtn = $("#rec-file", sheet);
   const saveArea = $("#rec-save-area", sheet);
+  const badgesEl = $("#rec-badges", sheet);
+  const vadBtn = $("#rec-vad", sheet);
   let tick = null, raf = null;
+
+  const recording = () => R.state === "recording" || R.state === "paused";
+
+  /* 상태 배지 — 화면 꺼짐 방지·VAD */
+  function paint() {
+    const bits = [];
+    if (R.wake === "held") bits.push(`<span class="rec-badge on">화면 꺼짐 방지 켜짐</span>`);
+    else if (recording()) bits.push(`<span class="rec-badge">화면 꺼짐 방지 대기</span>`);
+    else if (!wakeOK) bits.push(`<span class="rec-badge">화면 꺼짐 방지 미지원</span>`);
+    if (R.vad || (vad && vadOK && !recording() && R.state === "idle")) {
+      const t = recording() || R.state === "done" ? ` · 말한 구간 ${fmtClock(R.speechSec || 0)}` : "";
+      bits.push(`<span class="rec-badge${recording() && R.speaking ? " on" : ""}">VAD${t}</span>`);
+    }
+    if (!bits.length) bits.push(`<span class="rec-badge">말한 구간만 담기 · 화면 꺼짐 방지</span>`);
+    badgesEl.innerHTML = bits.join("");
+  }
+
+  vadBtn.addEventListener("click", () => {
+    if (recording()) return;
+    vad = !vad;
+    saveSettings({ vad });
+    vadBtn.setAttribute("aria-checked", vad ? "true" : "false");
+    paint();
+  });
+
+  const faceBtn = $("#rec-face", sheet);
+  faceBtn?.addEventListener("click", async () => {
+    if (faceOn) {
+      faceOn = false;
+      saveSettings({ faceDown: false });
+      stopFaceWatcher();
+      faceBtn.setAttribute("aria-checked", "false");
+      toast("뒤집어서 자동 녹음을 껐습니다");
+      return;
+    }
+    const ok = await askMotionPermission();
+    if (!ok) return toast("설정 → Safari → 동작 및 방향 접근을 허용해야 쓸 수 있습니다");
+    faceOn = true;
+    saveSettings({ faceDown: true });
+    startFaceWatcher();
+    faceBtn.setAttribute("aria-checked", "true");
+    toast("폰을 엎어 두면 1.5초 뒤 녹음이 시작됩니다");
+  });
+
+  addRecListener(paint);
+  paint();
 
   const bars = $$("i", waveEl);
   function draw() {
@@ -992,7 +1365,7 @@ function openRecorder() {
   mainBtn.addEventListener("click", async () => {
     if (R.state === "idle") {
       try {
-        await R.start();
+        await R.start({ vad });
       } catch (e) {
         return toast("마이크를 사용할 수 없습니다: " + (e.message || "권한 확인"));
       }
@@ -1000,8 +1373,11 @@ function openRecorder() {
       mainBtn.textContent = "정지";
       mainBtn.classList.add("stop");
       pauseBtn.disabled = false;
+      vadBtn.disabled = true;
       stateEl.textContent = "녹음 중";
-      tick = setInterval(updateTimer, 200);
+      if (vad && !R.vad) toast("이 브라우저에서는 침묵 건너뛰기를 켤 수 없습니다");
+      paint();
+      tick = setInterval(() => { updateTimer(); paint(); }, 250);
       draw();
       return;
     }
@@ -1012,9 +1388,11 @@ function openRecorder() {
       mainBtn.textContent = "다시";
       mainBtn.classList.remove("stop");
       pauseBtn.disabled = true;
+      vadBtn.disabled = !vadOK;
       stateEl.textContent = "녹음 완료 · 저장하세요";
       saved = out;
-      updateTimer();
+      timerEl.textContent = fmtClock(R.elapsedSec());
+      paint();
       showSaveForm(sheet, out, saveArea, () => { closeSheet(); });
       return;
     }
@@ -1024,12 +1402,15 @@ function openRecorder() {
     timerEl.textContent = "00:00";
     stateEl.textContent = "대기 중";
     mainBtn.textContent = "시작";
+    vadBtn.disabled = !vadOK;
     bars.forEach((b) => (b.style.height = "6px"));
+    paint();
   });
 
   pauseBtn.addEventListener("click", () => {
     if (R.state === "recording") { R.pause(); pauseBtn.textContent = "재개"; stateEl.textContent = "일시정지"; }
     else if (R.state === "paused") { R.resume(); pauseBtn.textContent = "일시"; stateEl.textContent = "녹음 중"; }
+    paint();
   });
 
   fileBtn.addEventListener("click", async () => {
@@ -1046,6 +1427,7 @@ function openRecorder() {
   // 시트 닫힐 때 정리
   sheet._onClose = () => {
     stopTimers();
+    delRecListener(paint);
     if (S.recorder.state === "recording" || S.recorder.state === "paused") S.recorder.cancel();
   };
 }
@@ -1061,7 +1443,7 @@ function showSaveForm(sheet, out, area, done) {
         ${Object.entries(TYPES).map(([k, v], i) => `<button class="chip ${i === 0 ? "" : ""}" data-t="${k}">${v.label}</button>`).join("")}
       </div></div>
     <button class="btn btn-primary btn-block" id="rec-save">드라이브에 저장</button>
-    <div style="font-size:11.5px;color:var(--muted-2);margin-top:8px;text-align:center">${hasGemini() ? "Gemini 키가 있어 이 기기에서 바로 전사합니다" : "저장 후 맥이 전사합니다 (보통 몇 분~다음 실행)"}</div>
+    <div style="font-size:11.5px;color:var(--muted-2);margin-top:8px;text-align:center">${recInfo(out)}</div>
   </div>`;
 
   let type = "work";
@@ -1076,7 +1458,7 @@ function showSaveForm(sheet, out, area, done) {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>';
     try {
-      await saveRecording({ blob: out.blob, duration: out.duration, mime: out.mime, name: out.name, title, type });
+      await saveRecording({ blob: out.blob, duration: out.duration, mime: out.mime, name: out.name, title, type, speechSec: out.speechSec });
       toast("저장했습니다");
       done();
     } catch (err) {
@@ -1088,7 +1470,16 @@ function showSaveForm(sheet, out, area, done) {
   });
 }
 
-async function saveRecording({ blob, duration, mime, name, title, type }) {
+function recInfo(out) {
+  const bits = [];
+  if (out?.vad && out.speechSec != null) {
+    bits.push(`말한 구간 ${fmtClock(out.speechSec)} / 전체 ${fmtClock(out.duration || 0)}`);
+  }
+  bits.push(hasGemini() ? "Gemini 키가 있어 이 기기에서 바로 전사합니다" : "저장 후 맥이 전사합니다 (보통 몇 분~다음 실행)");
+  return bits.join(" · ");
+}
+
+async function saveRecording({ blob, duration, mime, name, title, type, speechSec }) {
   const ext = extFor(mime || blob.type, name || "");
   const base = `${stamp()}_${type}_${uid(6)}`;
   const fileName = `${base}.${ext}`;
@@ -1099,6 +1490,7 @@ async function saveRecording({ blob, duration, mime, name, title, type }) {
     type,
     started_at: new Date(Date.now() - (duration || 0) * 1000).toISOString(),
     duration_sec: Math.round(duration || 0),
+    speech_sec: speechSec != null ? Math.round(speechSec) : undefined,
     source: "web",
     status: "pending",
     language: "ko",
@@ -1191,6 +1583,140 @@ async function uploadTranscriptForExisting(rec, data, blob) {
   }
 }
 
+/* ────────────────────────────────── 예약 녹음 · 유실 방지 ── */
+function renderAutoBar() {
+  const bar = $("#auto-bar");
+  if (!bar) return;
+  if (!S.auto.on) { bar.hidden = true; bar.innerHTML = ""; bar.classList.remove("show"); return; }
+  const now = new Date();
+  const d = getSchedule().days[DAY_KEYS[now.getDay()]] || {};
+  const el = (Date.now() - S.auto.startedAt) / 1000;
+  const speech = S.recorder.speechSec || 0;
+  bar.hidden = false;
+  bar.classList.add("show");
+  bar.innerHTML = `<span class="ab-dot"></span>
+    <div class="ab-main"><b>예약 녹음 중</b>
+      <span>${esc(d.start || "")}~${esc(d.end || "")} · ${fmtClock(el)} · 말한 구간 ${fmtClock(speech)}</span></div>
+    <button class="ab-stop" id="ab-stop">종료</button>`;
+  $("#ab-stop", bar).addEventListener("click", () => stopAutoRecording({ reason: "manual" }));
+}
+
+async function startAutoRecording(day) {
+  if (S.mode !== "live" || S.auto.on || S.auto.pending) return false;
+  if (S.recorder.state !== "idle") return false;
+  S.auto.pending = true;
+  try {
+    await S.recorder.start({ vad: localSettings().vad !== false });
+  } catch (e) {
+    // iOS 는 사용자 조작 없이는 마이크를 열지 못할 때가 있다 → 화면을 한 번 탭하면 다시 시도
+    console.warn("auto start blocked", e);
+    S.auto.pending = false;
+    S.auto.failAt = Date.now();
+    armGestureRetry();
+    return false;
+  }
+  S.auto.pending = false;
+  S.auto.failAt = 0;
+  S.auto.on = true;
+  S.auto.startedAt = Date.now();
+  S.auto.type = getSchedule().type || "work";
+  haptic(12);
+  clearInterval(S.auto.timer);
+  S.auto.timer = setInterval(renderAutoBar, 1000);
+  renderAutoBar();
+  toast(`예약 녹음을 시작했습니다${day?.start ? ` (${day.start}~${day.end})` : ""}`);
+  return true;
+}
+
+async function stopAutoRecording({ reason = "end" } = {}) {
+  if (!S.auto.on) return;
+  clearInterval(S.auto.timer);
+  S.auto.timer = null;
+  const out = await S.recorder.stop();
+  S.auto.on = false;
+  renderAutoBar();
+  if (!out || !out.blob?.size) return;
+  const title = `예약 녹음 ${fmtTime(new Date().toISOString())}`;
+  try {
+    await saveRecordingFast({ blob: out.blob, duration: out.duration, mime: out.mime, title, type: S.auto.type || "work", speechSec: out.speechSec });
+    toast(reason === "end" ? "예약 시간이 끝나 자동 저장했습니다" : "예약 녹음을 저장했습니다");
+  } catch (e) {
+    toast("기기에 보관했습니다 · 연결되면 올라갑니다");
+  }
+}
+
+function schedTick() {
+  if (S.mode !== "live") return;
+  const day = scheduleActiveNow();
+  if (day && !S.auto.on && !S.auto.pending && Date.now() - (S.auto.failAt || 0) > 60000) startAutoRecording(day);
+  else if (!day && S.auto.on) stopAutoRecording({ reason: "end" });
+}
+
+function armGestureRetry() {
+  if (S.auto.gestureBound) return;
+  S.auto.gestureBound = true;
+  const retry = () => {
+    document.removeEventListener("pointerdown", retry, true);
+    document.removeEventListener("keydown", retry, true);
+    S.auto.gestureBound = false;
+    S.auto.failAt = 0;
+    schedTick();
+  };
+  document.addEventListener("pointerdown", retry, true);
+  document.addEventListener("keydown", retry, true);
+}
+
+/* 화면이 가려지기 직전까지 모인 오디오를 잃지 않게 저장한다 */
+let _rescueBusy = false;
+async function rescueRecording(reason = "hidden") {
+  const R = S.recorder;
+  if (R.state !== "recording" && R.state !== "paused") return;
+  if (_rescueBusy) return;
+  _rescueBusy = true;
+  try {
+    const wasAuto = S.auto.on;
+    clearInterval(S.auto.timer);
+    S.auto.timer = null;
+    const out = await R.stop();
+    S.auto.on = false;
+    S.face.active = false;
+    hideSleepOverlay();
+    renderAutoBar();
+    if (S.sheet?._rec) closeSheet();
+    if (!out || !out.blob?.size) return;
+    const title = wasAuto
+      ? `예약 녹음 ${fmtTime(new Date().toISOString())}`
+      : `자동 저장 ${fmtTime(new Date().toISOString())}`;
+    await saveRecordingFast({ blob: out.blob, duration: out.duration, mime: out.mime, title, type: wasAuto ? S.auto.type : "work", speechSec: out.speechSec });
+  } catch (e) {
+    console.warn("rescue save failed", reason, e);
+  } finally {
+    _rescueBusy = false;
+  }
+}
+
+/* 기기 큐에 먼저 넣고, 이어서 드라이브 업로드를 시도한다(성공하면 큐에서 제거) */
+async function saveRecordingFast({ blob, duration, mime, title, type = "work", speechSec }) {
+  if (S.mode !== "live") throw new Error("데모에서는 저장되지 않습니다");
+  const ext = extFor(mime || blob.type, "");
+  const base = `${stamp()}_${type}_${uid(6)}`;
+  const fileName = `${base}.${ext}`;
+  const mimeType = mimeFor(ext);
+  let parent = null;
+  try { parent = await drive.inbox(); } catch {}
+  // 1) 로컬 큐(IndexedDB)에 먼저 보관 — 화면이 가려져도 유실되지 않게
+  try {
+    await store.pendingPut({ id: fileName, blob, name: fileName, parent, mime: mimeType, at: Date.now(), title, type, duration, speechSec });
+  } catch (e) { console.warn("queue failed", e); }
+  // 2) 드라이브 업로드 시도
+  if (parent) {
+    await drive.upload(blob, fileName, parent, { mimeType });
+    await store.pendingDel(fileName).catch(() => {});
+  }
+  syncNow().catch(() => {});
+  return fileName;
+}
+
 /* 대기 중 업로드 재시도 */
 async function flushPending() {
   if (S.mode !== "live") return;
@@ -1198,7 +1724,8 @@ async function flushPending() {
   try { items = await store.pendingAll(); } catch { return; }
   for (const it of items) {
     try {
-      await drive.upload(it.blob, it.name, it.parent, { mimeType: it.mime });
+      const parent = it.parent || await drive.inbox();
+      await drive.upload(it.blob, it.name, parent, { mimeType: it.mime });
       await store.pendingDel(it.id);
     } catch { break; }
   }

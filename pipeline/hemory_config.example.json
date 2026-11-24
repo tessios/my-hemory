@@ -18,7 +18,9 @@
     "whisper_model": "medium",
     "whisper_device": "cpu",
     "whisper_compute": "int8",
-    "language": "ko"
+    "language": "ko",
+    "_comment_vad": "침묵 구간 건너뛰기(기본 켜짐). min_silence_ms 를 키우면 더 긴 침묵만 건너뜁니다.",
+    "vad": { "enabled": true, "min_silence_ms": 600, "threshold": 0.5 }
   },
   "diarization": { "method": "auto" },
   "summary": {
