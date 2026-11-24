@@ -1,7 +1,7 @@
 /* Hemory 개인용 서비스 워커 — 앱 껍데기만 캐시. 드라이브/제미나이 응답은 절대 캐시하지 않는다.
-   v1.3.2: 네트워크 우선으로 바꿔 새 버전이 다음 실행에 바로 반영되게 했다.
+   v1.3.3: 뒤집어 녹음 감지(js/flip.js) 분리. v1.3.2: 네트워크 우선으로 바꿔 새 버전이 다음 실행에 바로 반영되게 했다.
            (예전에는 캐시 먼저라서 예전 화면·예전 코드가 계속 열렸다) */
-const VERSION = "hemory-v1.3.2";
+const VERSION = "hemory-v1.3.3";
 const SHELL = [
   "./",
   "./index.html",
@@ -14,6 +14,7 @@ const SHELL = [
   "./js/search.js",
   "./js/qa.js",
   "./js/record.js",
+  "./js/flip.js",
   "./js/util.js",
   "./icons/icon-180.png",
   "./icons/icon-192.png",

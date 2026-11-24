@@ -3,12 +3,41 @@
      화면이 잠기거나 전화가 오면 브라우저가 마이크를 끊는 것은 그대로입니다(웹의 한계).
    · VAD: AnalyserNode 의 RMS 로 발화 구간을 판별해, 침묵 구간은 게인 0 으로 막아 소리를 담지 않습니다.
      (웹 API 로는 컨테이너 길이를 줄일 수 없으므로, 침묵은 '무음으로' 남기고 실제 말한 구간만 전사합니다) */
+/* 마이크 권한 미리 받기 — 반드시 사용자 탭 핸들러에서 호출한다.
+   iOS 는 처음 한 번 허용해야 하며, 허용 전에는 센서(엎기)로 시작한 녹음이 조용히 막힌다. */
+export async function prewarmMic() {
+  try {
+    if (!navigator.mediaDevices?.getUserMedia) return "unsupported";
+    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
+    s.getTracks().forEach((t) => t.stop());
+    return "ok";
+  } catch (e) {
+    return e?.name === "NotAllowedError" || e?.name === "SecurityError" ? "denied" : "error";
+  }
+}
+
+/* 오디오 컨텍스트를 제스처 안에서 깨워 둔다.
+   iOS 는 제스처 밖에서 만든 AudioContext 가 'suspended' 로 남아 VAD 레벨 측정이 꺼진다.
+   한 번 깨운 컨텍스트는 이후(센서·예약으로 시작한 녹음에서도) 계속 쓸 수 있다. */
+let sharedCtx = null;
+export function unlockAudio() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!sharedCtx || sharedCtx.state === "closed") sharedCtx = new AC();
+    sharedCtx.resume?.().catch(() => {});
+    return sharedCtx;
+  } catch { return null; }
+}
+
 export class Recorder {
   constructor() {
     this.media = null;
     this.rec = null;
     this.chunks = [];
     this.ctx = null;
+    this._ownCtx = false;
+    this.src = null;
     this.analyser = null;
     this.stream = null;
     this.startedAt = 0;
@@ -165,9 +194,13 @@ export class Recorder {
     });
     this.mime = this._pickMime();
 
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const shared = unlockAudio();           // 제스처로 깨워 둔 컨텍스트가 있으면 그대로 쓴다
+    this._ownCtx = !shared;
+    this.ctx = shared || new AC();
     try { await this.ctx.resume?.(); } catch {}
     const src = this.ctx.createMediaStreamSource(this.stream);
+    this.src = src;
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 512;
     this.analyser.smoothingTimeConstant = 0.2;
@@ -255,8 +288,12 @@ export class Recorder {
     if (this._onVis) { document.removeEventListener("visibilitychange", this._onVis); this._onVis = null; }
     this._releaseWakeLock();
     try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
-    try { this.ctx?.close(); } catch {}
-    this.rec = null; this.stream = null; this.analyser = null; this.ctx = null; this.gate = null; this.dest = null;
+    try { this.src?.disconnect(); } catch {}
+    try { this.gate?.disconnect(); } catch {}
+    try { this.dest?.disconnect?.(); } catch {}
+    // 공유 컨텍스트는 닫지 않는다(다음 녹음에서 다시 쓰려고 깨워 둔 것)
+    if (this._ownCtx) { try { this.ctx?.close(); } catch {} }
+    this.rec = null; this.stream = null; this.analyser = null; this.ctx = null; this.gate = null; this.dest = null; this.src = null;
   }
 
   async stop() {

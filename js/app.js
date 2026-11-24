@@ -4,7 +4,8 @@ import { drive, AuthError } from "./drive.js";
 import { store } from "./store.js";
 import { buildIndex, search as doSearch, evidence, keywords, highlight } from "./search.js";
 import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./qa.js";
-import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration } from "./record.js";
+import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio } from "./record.js";
+import { FlipWatcher } from "./flip.js";
 import {
   $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, fmtMonth, dayKey, relDay,
   toast, haptic, debounce, uid, stamp, localSettings, saveSettings, sleep,
@@ -89,87 +90,99 @@ function recStatus() {
 function addRecListener(fn) { recListeners.add(fn); return fn; }
 function delRecListener(fn) { recListeners.delete(fn); }
 
-/* ── 뒤집어서 자동 녹음(Face-Down) ───────────────────── */
-const FACE = { beta: 145, up: 130, holdMs: 1500 };
-S.face = { watcherOn: false, armed: false, downSince: 0, active: false, startedAt: 0, timer: null };
+/* ── 뒤집어서 자동 녹음(Face-Down) ─────────────────────
+   감지·권한은 js/flip.js 의 FlipWatcher 가 맡고, 여기서는 녹음 시작/정지와 화면만 다룬다. */
+S.face = { active: false, startedAt: 0, timer: null, pending: false };
+
+const flip = new FlipWatcher({
+  onStart: () => startFaceRecording(),
+  onStop: () => stopFaceRecording(true),
+  onState: () => { renderFlipChip(); },
+  onSample: () => { paintFlipReadout(); },
+});
+S.flip = flip;
 
 function faceDownPref() { return localSettings().faceDown === true; }
 
-async function askMotionPermission() {
-  const DOE = window.DeviceOrientationEvent;
-  if (!DOE) return false;
-  if (typeof DOE.requestPermission === "function") {
-    try { return (await DOE.requestPermission()) === "granted"; } catch { return false; }
+/* 스위치 상태를 저장하고 감시를 켜고 끈다 */
+function setFaceDown(on, { prewarm = false } = {}) {
+  saveSettings({ faceDown: !!on });
+  flip.setArmed(!!on);
+  if (on) {
+    if (prewarm) { prewarmMic(); unlockAudio(); }
+  } else {
+    flip.disable();
   }
-  return true;
+  renderFlipChip();
+  return flip.state;
 }
 
-function startFaceWatcher() {
-  if (S.face.watcherOn || !window.DeviceOrientationEvent) return;
-  S.face.watcherOn = true;
-  window.addEventListener("deviceorientation", onOrient, true);
-}
-
-function stopFaceWatcher() {
-  if (!S.face.watcherOn) return;
-  S.face.watcherOn = false;
-  S.face.downSince = 0;
-  window.removeEventListener("deviceorientation", onOrient, true);
-}
-
-function armFacePermission() {
-  if (S.face.armed) return;
-  S.face.armed = true;
-  const once = async () => {
+/* 앱을 새로 열면 iOS 센서 권한은 다시 한 번 필요하다 → 첫 탭에서 조용히 요청 */
+function armFlipPermission() {
+  if (S.facePermissionArmed) return;
+  S.facePermissionArmed = true;
+  const once = async (e) => {
     document.removeEventListener("pointerdown", once, true);
     document.removeEventListener("keydown", once, true);
-    S.face.armed = false;
-    if (!faceDownPref()) return;
-    if (await askMotionPermission()) startFaceWatcher();
+    S.facePermissionArmed = false;
+    if (!faceDownPref() || flip.granted || flip.askedThisLoad) return;
+    // 스위치·권한 버튼을 직접 누른 경우는 그쪽 핸들러가 처리한다
+    const t = e?.target;
+    if (t?.closest?.("#s-flip-on, #s-flip-perm, #rec-face, #s-flip-test")) return;
+    const r = await flip.requestPermission();
+    if (r.ok) { flip.start(); toast("뒤집어 녹음 준비됨 · 폰을 엎어 보세요", 1800); }
+    else renderFlipChip();
   };
   document.addEventListener("pointerdown", once, true);
   document.addEventListener("keydown", once, true);
 }
 
-function onOrient(e) {
-  if (e.beta == null) return;
-  const b = Math.abs(e.beta);
-  const now = Date.now();
-  if (b > FACE.beta) {
-    if (!S.face.downSince) S.face.downSince = now;
-    if (!S.face.active && !S.auto.on && S.recorder.state === "idle" && now - S.face.downSince >= FACE.holdMs) {
-      startFaceRecording();
-    }
-  } else {
-    S.face.downSince = 0;
-    if (S.face.active && b < FACE.up) stopFaceRecording();
-  }
-}
-
 async function startFaceRecording() {
-  if (S.mode !== "live" || S.face.active) return;
-  if (S.recorder.state !== "idle" || S.sheet?._rec) return;
+  if (S.mode !== "live") return false;
+  if (S.face.active) return false;
+  if (!recorderIdle()) return false;                 // 이미 다른 녹음이 진행 중
+  // 녹음 시트가 열려 있어도(대기 상태면) 닫고 시작 — 엎는 순간이 우선이다
+  if (S.sheet?._rec) { try { closeSheet(); } catch {} }
+  S.face.pending = false;
   try {
     await S.recorder.start({ vad: localSettings().vad !== false });
   } catch (e) {
     console.warn("face start", e);
-    toast("엎어 녹음을 시작하려면 앱을 한 번 탭해 주세요");
-    return;
+    S.face.pending = true;
+    showSleepOverlay("tap");
+    toast("마이크를 열지 못했습니다 · 검은 화면을 한 번 탭해 주세요", 3200);
+    return false;
   }
   S.face.active = true;
   S.face.startedAt = Date.now();
+  S.face.pending = false;
+  if (!flip.active) flip.adopt();     // 탭으로 시작한 경우에도 들면 자동 저장되도록
   haptic(16);
   showSleepOverlay();
   clearInterval(S.face.timer);
   S.face.timer = setInterval(updateSleepOverlay, 1000);
+  renderFlipChip();
+  return true;
+}
+
+/* 이전 녹음이 'done' 상태로 남아 있으면 idle 로 되돌린다 */
+function recorderIdle() {
+  const R = S.recorder;
+  if (R.state === "done") { try { R.cancel(); } catch {} }
+  return R.state === "idle";
 }
 
 async function stopFaceRecording(save = true) {
-  if (!S.face.active) return;
+  const was = S.face.active || S.face.pending;
+  if (!was) return;
   S.face.active = false;
+  S.face.pending = false;
   clearInterval(S.face.timer);
   S.face.timer = null;
   hideSleepOverlay();
+  flip.markStopped();
+  renderFlipChip();
+  if (S.recorder.state === "idle") return;
   const out = await S.recorder.stop();
   if (!save || !out || !out.blob?.size) return;
   const title = `뒤집어 녹음 ${fmtTime(new Date().toISOString())}`;
@@ -182,9 +195,11 @@ async function stopFaceRecording(save = true) {
   }
 }
 
-function showSleepOverlay() {
+function showSleepOverlay(mode) {
   const el = $("#sleep-overlay");
   if (!el) return;
+  const hint = $(".so-hint", el);
+  if (hint) hint.textContent = mode === "tap" ? "화면을 한 번 탭하면 녹음을 시작합니다" : "들면 자동으로 저장합니다";
   el.hidden = false;
   requestAnimationFrame(() => el.classList.add("show"));
   updateSleepOverlay();
@@ -195,13 +210,62 @@ function hideSleepOverlay() {
   if (!el) return;
   el.classList.remove("show");
   el.hidden = true;
+  S.face.pending = false;
 }
 
 function updateSleepOverlay() {
   const el = $("#sleep-overlay");
   if (!el || el.hidden) return;
   const t = $("#so-time", el);
-  if (t) t.textContent = fmtClock((Date.now() - S.face.startedAt) / 1000);
+  if (t) {
+    t.textContent = S.face.active
+      ? fmtClock((Date.now() - S.face.startedAt) / 1000)
+      : S.face.pending ? "—" : fmtClock(0);
+  }
+  renderFlipChip();
+}
+
+/* 타임라인 위의 '뒤집어 녹음' 상태 칩 — 지금 켜져 있는지/권한이 필요한지 보이게 */
+function renderFlipChip() {
+  const el = $("#flip-chip");
+  if (!el) return;
+  const show = S.mode === "live" && (faceDownPref() || flip.state === "active");
+  el.hidden = !show;
+  if (!show) return;
+  el.dataset.state = flip.state;
+  const t = flip.state === "active" ? ` · ${fmtClock(flip.elapsedSec)}` : "";
+  el.innerHTML = `<span class="fc-dot"></span><span>뒤집어 녹음 · ${esc(flip.label)}${t}</span>`;
+}
+
+/* 설정 화면의 실시간 센서 표시 */
+let _flipPaintAt = 0;
+function paintFlipReadout(force = false) {
+  const body = $("#settings-body");
+  if (!body) return;
+  const nowEl = $("#s-flip-now", body);
+  if (!nowEl) return;
+  const now = Date.now();
+  if (!force && now - _flipPaintAt < 180) return;
+  _flipPaintAt = now;
+  const beta = flip.last.beta, gz = flip.last.gz;
+  const has = flip.hasSignal;
+  nowEl.textContent = has
+    ? `${flip.poseLabel} · β ${beta == null ? "—" : Math.round(beta)}° · z ${gz == null ? "—" : gz.toFixed(1)}`
+    : (flip.granted ? "센서 값을 기다리는 중…" : "센서 권한을 허용하면 값이 보입니다");
+  const verdict = $("#s-flip-verdict", body);
+  if (verdict) {
+    verdict.dataset.pose = flip.pose;
+    verdict.textContent = flip.active ? "녹음 중입니다"
+      : flip.pose === "down" ? "엎임 — 이 상태가 1.5초 이어지면 녹음이 시작됩니다"
+      : flip.pose === "up" ? "화면이 위 — 폰을 엎어 보세요"
+      : flip.pose === "tilt" ? "들고 있는 상태 — 책상에 엎어 두세요"
+      : "센서 신호를 기다리는 중";
+  }
+  const permEl = $("#s-flip-perm", body);
+  if (permEl) {
+    permEl.textContent = flip.perm === "denied" ? "차단됨"
+      : flip.granted ? (flip.hasSignal ? "허용됨 · 신호 정상" : "허용됨") : "확인 필요";
+  }
 }
 
 
@@ -348,21 +412,39 @@ function bindGlobal() {
   /* 화면이 가려지기 전까지 모인 소리는 잃지 않게 저장 */
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") rescueRecording("hidden");
-    else { schedTick(); renderAutoBar(); resumeConnection(); }
+    else {
+      schedTick(); renderAutoBar(); resumeConnection();
+      // 앱으로 돌아오면 센서 감시를 다시 건다(백그라운드에서 브라우저가 리스너를 쉬게 한다)
+      if (faceDownPref() && flip.granted && !flip.listening) flip.start();
+      renderFlipChip();
+    }
   });
   window.addEventListener("pagehide", () => { rescueRecording("pagehide"); });
 
-  /* 절전 오버레이를 탭하면 바로 종료·저장 */
+  /* 절전 오버레이를 탭하면 바로 종료·저장(시작이 막혀 있으면 시작) */
   $("#sleep-overlay")?.addEventListener("click", () => {
     if (S.face.active) stopFaceRecording(true);
+    else if (S.face.pending) {
+      S.face.pending = false;
+      hideSleepOverlay();
+      startFaceRecording();
+    }
   });
 
-  /* 예열: 예약 녹음 20초마다 확인, 뒤집어 녹음은 첫 탭에서 동작 권한 */
+  /* 타임라인의 상태 칩 → 설정의 뒤집어 녹음 항목 */
+  $("#flip-chip")?.addEventListener("click", () => {
+    setTab("settings");
+    setTimeout(() => $("#sgroup-flip")?.scrollIntoView({ block: "center", behavior: "smooth" }), 60);
+  });
+
+  /* 예열: 예약 녹음 20초마다 확인, 뒤집어 녹음은 첫 탭에서 센서 권한 */
   setInterval(schedTick, 20000);
   if (faceDownPref()) {
-    startFaceWatcher();
-    armFacePermission();
+    flip.setArmed(true);
+    if (flip.granted) flip.start();          // 권한이 이미 있는 환경(안드로이드·데스크톱)
+    else armFlipPermission();                // 아이폰: 앱을 새로 열면 한 번 더 물어야 한다
   }
+  renderFlipChip();
 }
 
 function setBtnLoading(btn, on) {
@@ -388,9 +470,10 @@ function setTab(tab) {
   $$("#tabbar button").forEach((b) => b.classList.toggle("active", b.dataset.tab === tab));
   showScreen(tab);
   $("#fab").hidden = tab !== "timeline";
-  if (tab === "timeline") renderTimeline();
+  if (tab === "timeline") { renderTimeline(); renderFlipChip(); }
   if (tab === "search") { renderSearch(); setTimeout(() => $("#q").focus(), 120); }
   if (tab === "settings") renderSettings();
+  else if (typeof flip !== "undefined") flip.setProbe(false);
 }
 
 /* ────────────────────────────────── 모드 ── */
@@ -1088,8 +1171,10 @@ function closeSheet(immediate = false) {
   const sheet = root.querySelector(".sheet");
   const backdrop = root.querySelector(".sheet-backdrop");
   clearTimeout(_sheetClearTimer);
+  if (sheet) { try { sheet._onClose?.(); } catch (e) { console.warn(e); } }
+  // 닫힌 시트를 계속 '열려 있는 시트'로 참조하면 엎어 녹음·예약 녹음이 영영 막힌다
+  S.sheet = null;
   if (!sheet) { if (immediate) root.innerHTML = ""; return; }
-  try { sheet._onClose?.(); } catch (e) { console.warn(e); }
   if (immediate) { root.innerHTML = ""; return; }
   sheet.style.transform = "";
   sheet.classList.remove("show");
@@ -1184,6 +1269,20 @@ async function renderSettings() {
     <p class="note">월~일 각각 켜고 끄고, 자정을 넘기는 구간(예: 22:00~06:00)도 됩니다. 아이폰은 앱을 한 번 탭해야 마이크가 열리므로, 자동 시작이 막히면 화면을 한 번 탭해 주세요.</p>
   </div>
 
+  <div class="sgroup" id="sgroup-flip">
+    <h2>뒤집어서 자동 녹음</h2>
+    <div class="srow"><span class="k">뒤집어 녹음</span>
+      <button class="sw" id="s-flip-on" role="switch" aria-checked="${faceDownPref() ? "true" : "false"}" aria-label="뒤집어서 자동 녹음"${flip.supported ? "" : " disabled"}><i></i></button></div>
+    <div class="srow"><span class="k">센서 권한</span><span class="v" id="s-flip-perm">${flip.perm === "denied" ? "차단됨" : flip.granted ? (flip.hasSignal ? "허용됨 · 신호 정상" : "허용됨") : "확인 필요"}</span></div>
+    <div class="flip-test">
+      <div class="flip-now" id="s-flip-now">—</div>
+      <div class="flip-verdict" id="s-flip-verdict" data-pose="${flip.pose}">${flip.active ? "녹음 중입니다" : "폰을 엎으면 이 칸이 검게 바뀝니다"}</div>
+    </div>
+    <button class="btn btn-line btn-block" id="s-flip-perm">센서 권한 허용 · 다시 요청</button>
+    <p class="note">켜 두면 <b>어느 화면에 있든</b> 폰을 엎기만 하면 1.5초 뒤 녹음이 시작되고 화면은 검게 절전합니다. 다시 들면 자동 저장.<br>
+    아이폰은 앱을 새로 열 때마다 센서 권한을 한 번 더 물어봅니다(브라우저 보안 규칙). 위 상태가 <b>허용됨 · 신호 정상</b>이면 준비된 것이고, <b>확인 필요</b>면 <b>센서 권한 허용</b>을 한 번 눌러 주세요. 켤 때 마이크 권한도 함께 미리 허용해 둡니다.</p>
+  </div>
+
   <div class="sgroup">
     <h2>데이터</h2>
     <div class="srow"><span class="k">기록</span><span class="v">${S.records.length}건 (이 기기 캐시)</span></div>
@@ -1260,6 +1359,33 @@ async function renderSettings() {
     saveSchedule({ type: b.dataset.stype });
     renderSettings();
   }));
+
+  /* 뒤집어 녹음 — 켤 때 탭 안에서 센서 권한 + 마이크 예열까지 */
+  $("#s-flip-on")?.addEventListener("click", async () => {
+    if (faceDownPref()) {
+      setFaceDown(false);
+      renderSettings();
+      toast("뒤집어서 자동 녹음을 껐습니다");
+      return;
+    }
+    const r = await flip.enable();
+    if (r.ok) { prewarmMic(); unlockAudio(); }
+    setFaceDown(r.ok);
+    renderSettings();
+    toast(r.ok
+      ? "뒤집어 녹음을 켰습니다 · 앱을 켜 둔 채 폰을 엎어 보세요"
+      : "센서 권한이 필요합니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
+  });
+  $("#s-flip-perm")?.addEventListener("click", async () => {
+    const r = await flip.requestPermission();
+    if (r.ok) { prewarmMic(); unlockAudio(); }
+    flip.setArmed(faceDownPref());
+    renderSettings();
+    toast(r.ok ? "센서 권한을 허용했습니다" : "권한이 거부되었습니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
+  });
+
+  flip.setProbe(true);          // 설정 화면에서는 녹음 없이 센서 값만 보여 준다
+  paintFlipReadout(true);
 }
 
 /* ────────────────────────────────── 아이폰 단축어 가이드 ── */
@@ -1415,19 +1541,22 @@ function openRecorder() {
   faceBtn?.addEventListener("click", async () => {
     if (faceOn) {
       faceOn = false;
-      saveSettings({ faceDown: false });
-      stopFaceWatcher();
+      setFaceDown(false);
       faceBtn.setAttribute("aria-checked", "false");
       toast("뒤집어서 자동 녹음을 껐습니다");
       return;
     }
-    const ok = await askMotionPermission();
-    if (!ok) return toast("설정 → Safari → 동작 및 방향 접근을 허용해야 쓸 수 있습니다");
+    faceBtn.disabled = true;
+    const r = await flip.enable();            // 탭 안에서 곧바로 센서 권한 요청
+    if (r.ok) { prewarmMic(); unlockAudio(); } // 마이크·오디오도 미리 열어 둔다(제스처가 있을 때)
+    faceBtn.disabled = false;
+    if (!r.ok) {
+      return toast(r.reason === "unsupported" ? "이 브라우저는 센서를 지원하지 않습니다" : "아이폰 설정 → 앱 → 동작 및 방향 접근을 허용해야 쓸 수 있습니다");
+    }
     faceOn = true;
-    saveSettings({ faceDown: true });
-    startFaceWatcher();
+    setFaceDown(true);
     faceBtn.setAttribute("aria-checked", "true");
-    toast("폰을 엎어 두면 1.5초 뒤 녹음이 시작됩니다");
+    toast("폰을 엎어 두면 1.5초 뒤 녹음이 시작되고, 들면 자동 저장됩니다");
   });
 
   addRecListener(paint);
@@ -1693,7 +1822,8 @@ function renderAutoBar() {
 
 async function startAutoRecording(day) {
   if (S.mode !== "live" || S.auto.on || S.auto.pending) return false;
-  if (S.recorder.state !== "idle" || S.sheet?._rec) return false;
+  if (S.sheet?._rec) return false;
+  if (!recorderIdle()) return false;
   S.auto.pending = true;
   try {
     await S.recorder.start({ vad: localSettings().vad !== false });
@@ -1770,7 +1900,11 @@ async function rescueRecording(reason = "hidden") {
     const out = await R.stop();
     S.auto.on = false;
     S.face.active = false;
+    S.face.pending = false;
+    clearInterval(S.face.timer);
+    S.face.timer = null;
     hideSleepOverlay();
+    flip.markStopped();
     renderAutoBar();
     if (S.sheet?._rec) closeSheet();
     if (!out || !out.blob?.size) return;
