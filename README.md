@@ -8,6 +8,7 @@ Hemory(hemory.com)의 핵심 흐름 — 녹음 → 자동 전사(타임스탬프
 ## 지금 상태 (2026-11-24)
 
 - **OAuth 발급 완료** — 개인 모드 프로젝트 `personal-mode-app` 의 웹/데스크톱 클라이언트. 웹 클라이언트 ID는 `js/config.js` 에 기본값으로 들어 있어 폰에서 바로 "Google 계정으로 시작" 가능. 자세히는 [docs/setup-oauth.md](docs/setup-oauth.md).
+- **로그인 유지(v1.3.2)** — 로그인한 사람을 토큰과 별도로 저장해 1시간 만료·앱 재실행에도 첫 화면으로 돌아가지 않습니다. 만료 시 무음 자동 갱신(아이폰 홈 화면 앱은 리다이렉트, 데스크톱은 팝업), 실패 시 앱 안 '다시 연결' 막대. [docs/iphone.md#5-로그인-유지-v132](docs/iphone.md).
 - **맥 파이프라인 가동** — 집 맥(Sophias-iMac)에 설치되어 launchd 로 30분마다 드라이브를 훑어 전사·저장합니다. 상태·실측값·장애 대응은 [docs/mac-pipeline.md](docs/mac-pipeline.md).
 - **남은 것: Gemini API 키** — 요약·화자 추정·AI 질문에 필요. 없으면 전사·검색·재생만 동작하고 요약 칸이 비어 있습니다.
 
