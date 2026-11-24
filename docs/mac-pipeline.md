@@ -14,6 +14,17 @@
 
 ## 1. 파일 설치
 
+가장 빠른 길(권장) — 저장소에서 스크립트를 받아 설치합니다:
+
+```bash
+cd ~/Downloads
+git clone --depth 1 https://github.com/tessios/my-hemory.git my-hemory-src
+zsh my-hemory-src/pipeline/install-mac.sh          # ~/hemory-pipeline 에 설치
+# Gemini 전사만 쓸 경우: HEMORY_SKIP_WHISPER=1 zsh my-hemory-src/pipeline/install-mac.sh
+```
+
+수동 설치:
+
 ```bash
 mkdir -p ~/hemory-pipeline && cd ~/hemory-pipeline
 # 저장소에서 pipeline 폴더 복사
