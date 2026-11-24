@@ -906,7 +906,7 @@ function openSetupSheet() {
       <ol style="padding-left:18px;font-size:13.5px;line-height:1.85;color:var(--ink-2);margin:8px 0 14px">
         <li>console.cloud.google.com → 새 프로젝트 <b>hemory-personal</b></li>
         <li>API 및 서비스 → 라이브러리 → <b>Google Drive API</b> 사용 설정</li>
-        <li>OAuth 동의 화면 → 외부 → 테스트 사용자에 <b>korea.yoonchan.kim@gmail.com</b> 추가</li>
+        <li>OAuth 동의 화면 → 외부 → 테스트 사용자에 <b>본인 계정</b> 추가</li>
         <li>사용자 인증 정보 → OAuth 클라이언트 ID → <b>웹 애플리케이션</b></li>
         <li>승인된 JavaScript 출처: <code>https://tessios.github.io</code><br>
             승인된 리디렉션 URI: <code>https://tessios.github.io/my-hemory/</code></li>

@@ -7,7 +7,7 @@
   "retention_days": 365,
 
   "_comment_local": "backend=local 이면 아래 경로(구글 드라이브 데스크톱 앱 동기화 폴더)를 씁니다.",
-  "local_root": "~/Library/CloudStorage/GoogleDrive-korea.yoonchan.kim@gmail.com/내 드라이브/Hemory-개인녹음",
+  "local_root": "~/Library/CloudStorage/GoogleDrive-<내계정>/내 드라이브/Hemory-개인녹음",
 
   "_comment_drive": "backend=drive 이면 OAuth 파일 경로입니다. hemory_auth.py 가 만들어 둡니다.",
   "credentials": "~/.config/hemory/client_secret.json",

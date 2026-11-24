@@ -29,8 +29,8 @@ pip install -r requirements.txt          # faster-whisper (약 5분, 모델은 �
 ## 2. 드라이브 연결 — 둘 중 하나
 
 ### A. 구글 드라이브 데스크톱 앱 (가장 단순, 권장)
-1. **Google 드라이브** 앱 설치 → `korea.yoonchan.kim@gmail.com` 로그인 → **내 드라이브 스트리밍** 선택
-2. 동기화 위치: `~/Library/CloudStorage/GoogleDrive-korea.yoonchan.kim@gmail.com/내 드라이브/Hemory-개인녹음`
+1. **Google 드라이브** 앱 설치 → 평소 쓰는 본인 계정 로그인 → **내 드라이브 스트리밍** 선택
+2. 동기화 위치: `~/Library/CloudStorage/GoogleDrive-<내계정>/내 드라이브/Hemory-개인녹음`
 3. 설정에서 `backend: "local"`, `local_root` 를 위 경로로 지정
 
 ### B. Drive API (앱 설치 없이)

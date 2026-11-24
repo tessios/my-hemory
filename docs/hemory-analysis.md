@@ -34,7 +34,7 @@
 ## 저장 구조 (구글 드라이브 `Hemory-개인녹음/`)
 
 ```
-Hemory-개인녹음/                  id 1RJDGCj2oVnhcL9uHzgrURzGczdJYgw2f
+Hemory-개인녹음/                  내 드라이브 최상위 (앱이 자동 생성)
 ├── _inbox/                       아이폰 음성메모·단축어가 올리는 곳 (맥이 처리 후 비움)
 ├── 2026-11/                      월별 폴더 (맥이 자동 생성)
 │   ├── 20261124-0930_meeting_a1b2c3.m4a

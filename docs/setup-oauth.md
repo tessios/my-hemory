@@ -12,9 +12,9 @@
 2. 왼쪽 메뉴 **API 및 서비스 → 라이브러리** → `Google Drive API` 검색 → **사용 설정**
 3. **API 및 서비스 → OAuth 동의 화면**
    - User Type: **외부** → 만들기
-   - 앱 이름 `Hemory`, 사용자 지원 이메일·개발자 연락처: `korea.yoonchan.kim@gmail.com`
+   - 앱 이름 `Hemory`, 사용자 지원 이메일·개발자 연락처: 본인 Gmail
    - 범위(Scopes): **추가하지 않아도 됩니다**(앱이 요청 시 지정). 굳이 추가하려면 `.../auth/drive`
-   - 테스트 사용자: **korea.yoonchan.kim@gmail.com 추가** (이걸 빠뜨리면 로그인 시 `403 access_denied`)
+   - 테스트 사용자: **앱에 로그인할 본인 계정 추가** (이걸 빠뜨리면 로그인 시 `403 access_denied`)
    - 게시 상태는 **테스트** 그대로 두면 됩니다(본인 계정만 쓰므로 검증 불필요)
 4. **API 및 서비스 → 사용자 인증 정보 → 사용자 인증 정보 만들기 → OAuth 클라이언트 ID**
    - 애플리케이션 유형: **웹 애플리케이션**
@@ -25,7 +25,7 @@
    - 만들기 → 표시되는 `....apps.googleusercontent.com` 값 복사
 5. 폰에서 <https://tessios.github.io/my-hemory/> 열기
    - 첫 화면 **"처음 설정 · Client ID 입력"** → 붙여넣기 → 저장
-   - **Google 계정으로 시작** → `korea.yoonchan.kim@gmail.com` 선택 → 권한 허용
+   - **Google 계정으로 시작** → 본인 계정 선택 → 권한 허용
 6. 앱이 드라이브의 `Hemory-개인녹음/` 폴더를 찾고, 없으면 새로 만듭니다(이미 만들어 둔 폴더가 있습니다).
 
 ## 맥(전사 파이프라인)용 인증은 따로 1회

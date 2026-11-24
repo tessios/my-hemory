@@ -7,7 +7,7 @@ Google Cloud Console 에서 **OAuth 클라이언트 ID → 데스크톱 앱** �
 
     python3 hemory_auth.py --client-secret ~/Downloads/client_secret_xxx.json
 
-브라우저가 열리면 korea.yoonchan.kim@gmail.com 계정으로 동의하면
+브라우저가 열리면 평소 쓰는 본인 구글 계정으로 동의하면
 `~/.config/hemory/token.json` 이 만들어지고, 그 뒤로는 자동 갱신됩니다.
 
 프롬프트만 있는 환경(원격 SSH 등)에서는:
