@@ -874,7 +874,7 @@ async function renderSettings() {
   <div class="sgroup">
     <h2>정보</h2>
     <div class="srow"><span class="k">버전</span><span class="v">${CONFIG.version}</span></div>
-    <div class="srow"><span class="k">전사 파이프라인</span><span class="v">맥(Sophias-iMac) 자동 처리</span></div>
+    <div class="srow"><span class="k">전사 파이프라인</span><span class="v">맥 자동 처리</span></div>
   </div>`;
 
   $("#s-sync").addEventListener("click", () => syncNow({ manual: true }));
