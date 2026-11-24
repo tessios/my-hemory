@@ -300,7 +300,7 @@ function pendingRecord(fileMeta, base) {
   return {
     id: "p-" + base,
     base,
-    title: m ? prettySlug(m[4]) : "전사 대기 중인 녹음",
+    title: m ? `${(TYPES[m[3]] || TYPES.etc).label} 녹음` : "전사 대기 중인 녹음",
     type: m && TYPES[m[3]] ? m[3] : "etc",
     started_at: started,
     duration_sec: 0,
@@ -639,6 +639,8 @@ async function fetchAudioBlob(fileId) {
 function setupPlayer(rec, opts = {}) {
   const audio = new Audio();
   audio.preload = "metadata";
+  audio.setAttribute("playsinline", "");
+  audio.style.display = "none";
   let rate = 1;
   const nodes = {
     toggle: $("#pl-toggle"), fill: $("#pl-fill"), cur: $("#pl-cur"), dur: $("#pl-dur"),
@@ -649,11 +651,21 @@ function setupPlayer(rec, opts = {}) {
   if (rec.audioId && S.mode === "live" && drive.token) {
     audio.src = drive.audioUrl(rec.audioId);
   }
+  let tokenRetried = false;
+  audio.addEventListener("error", async () => {
+    if (tokenRetried || !rec.audioId || S.mode !== "live") return;
+    tokenRetried = true;
+    try {
+      await drive.ensureToken();
+      audio.src = drive.audioUrl(rec.audioId);
+    } catch {}
+  });
 
   const icon = (playing) => (playing
     ? '<svg viewBox="0 0 24 24" width="16" height="16"><rect x="6" y="5" width="4" height="14" fill="currentColor"/><rect x="14" y="5" width="4" height="14" fill="currentColor"/></svg>'
     : '<svg viewBox="0 0 24 24" width="16" height="16" style="margin-left:2px"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></svg>');
 
+  nodes.toggle.parentElement.appendChild(audio);
   const setPlaying = (p) => { nodes.toggle.innerHTML = icon(p); };
   setPlaying(false);
 
