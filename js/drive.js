@@ -165,6 +165,11 @@ export const drive = {
     return res.json();
   },
 
+  async about() {
+    const j = await this.req("/about?fields=user(displayName,emailAddress)");
+    return j.user || {};
+  },
+
   /* ── 폴더 ─────────────────────────────── */
   async _findFolder(name, parentId = "root") {
     const q = `name = '${name.replace(/'/g, "\\'")}' and mimeType = 'application/vnd.google-apps.folder' and '${parentId}' in parents and trashed = false`;

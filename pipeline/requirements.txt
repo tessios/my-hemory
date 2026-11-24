@@ -1,0 +1,7 @@
+# 전사(로컬, 무료) — Apple Silicon CPU int8 기준 medium 모델 권장
+faster-whisper>=1.0.3
+
+# (선택) 정확한 화자 분리 — HuggingFace 토큰 필요
+# pyannote.audio>=3.1.1
+
+# 나머지는 파이썬 표준 라이브러리만 사용합니다(요청·인증·드라이브 업로드 포함).

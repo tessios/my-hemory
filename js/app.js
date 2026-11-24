@@ -130,6 +130,10 @@ async function enterDemo() {
 async function enterLive() {
   S.mode = "live";
   showChrome();
+  drive.about().then((u) => {
+    if (u.emailAddress) localStorage.setItem("hemory.email", u.emailAddress);
+    if (S.tab === "settings") renderSettings();
+  }).catch(() => {});
   const cached = await store.allRecords().catch(() => []);
   if (cached.length) {
     S.records = cached.sort(byRecent);
@@ -654,6 +658,7 @@ function setupPlayer(rec, opts = {}) {
   setPlaying(false);
 
   const seek = (t) => {
+    if (!audio.src) { highlightSegment(t); return; }
     try { audio.currentTime = Math.max(0, t); } catch {}
     if (!audio.paused) return;
     audio.play().then(() => setPlaying(true)).catch(() => toast("오디오를 재생할 수 없습니다"));
