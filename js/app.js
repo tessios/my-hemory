@@ -148,7 +148,7 @@ function onOrient(e) {
 
 async function startFaceRecording() {
   if (S.mode !== "live" || S.face.active) return;
-  if (S.recorder.state !== "idle") return;
+  if (S.recorder.state !== "idle" || S.sheet?._rec) return;
   try {
     await S.recorder.start({ vad: localSettings().vad !== false });
   } catch (e) {
@@ -1159,8 +1159,11 @@ async function renderSettings() {
   }));
   $$("#settings-body .sch-row input[type=time]").forEach((inp) => inp.addEventListener("change", () => {
     const k = inp.dataset.day, field = inp.dataset.k, val = inp.value;
-    if (!/^\d{2}:\d{2}$/.test(val)) return toast("시간을 다시 확인해 주세요");
     const cur = getSchedule();
+    if (!/^\d{2}:\d{2}$/.test(val)) {
+      inp.value = cur.days[k][field]; // 형식이 아닌 값은 되돌린다
+      return;
+    }
     const days = { ...cur.days, [k]: { ...cur.days[k], [field]: val } };
     saveSchedule({ days });
     toast("예약 시간을 저장했습니다");
@@ -1603,7 +1606,7 @@ function renderAutoBar() {
 
 async function startAutoRecording(day) {
   if (S.mode !== "live" || S.auto.on || S.auto.pending) return false;
-  if (S.recorder.state !== "idle") return false;
+  if (S.recorder.state !== "idle" || S.sheet?._rec) return false;
   S.auto.pending = true;
   try {
     await S.recorder.start({ vad: localSettings().vad !== false });
