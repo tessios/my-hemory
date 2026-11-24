@@ -81,6 +81,16 @@ export const drive = {
       this.email = sess.email || "";
       this.name = sess.name || "";
       this.since = Number(sess.since) || 0;
+    } else if (t && t.access_token) {
+      // v1.3.1 이하에서 로그인해 둔 사용자: 토큰 기록은 남아 있으니 세션으로 승격한다.
+      // (앱에서 '연결 해제'를 한 경우에는 토큰 기록도 지워지므로 여기 걸리지 않는다)
+      let legacy = "";
+      try { legacy = localStorage.getItem("hemory.email") || ""; } catch {}
+      if (legacy) {
+        this.email = legacy;
+        this.since = Date.now();
+        this._remember();
+      }
     }
 
     const auth = readJSON(AUTH_KEY, {});
