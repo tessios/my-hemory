@@ -229,7 +229,7 @@ function updateSleepOverlay() {
 function renderFlipChip() {
   const el = $("#flip-chip");
   if (!el) return;
-  const show = S.mode === "live" && (faceDownPref() || flip.state === "active");
+  const show = S.mode === "live" && !S.auto.on && (faceDownPref() || flip.state === "active");
   el.hidden = !show;
   if (!show) return;
   el.dataset.state = flip.state;
