@@ -1338,7 +1338,7 @@ function renderDay() {
   const blocks = flow.blocks.map((b) => {
     const r = byId.get(b.id);
     const t = TYPES[r.type] || TYPES.etc;
-    const short = b.height < 140;
+    const short = b.height < 128;
     const picked = S.sel.ids.has(r.id);
     return `<button class="blk ${r.status === "pending" ? "pending" : ""} ${picked ? "on" : ""}" data-id="${esc(r.id)}" data-short="${short ? 1 : 0}" style="top:${b.top}px;height:${b.height}px">
       <span class="blk-range">${esc(blockRangeLabel(r.started_at, r.duration_sec))}</span>
