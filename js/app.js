@@ -1321,14 +1321,20 @@ function renderDay() {
   const byId = new Map(recs.map((r) => [r.id, r]));
 
   /* 시간 눈금: 흐름의 정시 눈금 + 블록의 실제 시작/종료(정시 눈금과 겹치면 생략) */
-  let labels = flow.ticks.map((t) => `<span class="hlabel" style="top:${t.top}px">${hhmm(t.min)}</span>`).join("");
   const near = (m) => flow.ticks.some((t) => Math.abs(t.min - m) <= 14);
+  const edges = [];
   for (const b of flow.blocks) {
-    for (const [m, top] of [[Math.round(b.startMin), b.top], [Math.round(b.endMin), b.top + b.height]]) {
-      if (near(m)) continue;
-      labels += `<span class="hlabel edge" style="top:${top}px">${hhmm(m)}</span>`;
-    }
+    edges.push([Math.round(b.startMin), b.top]);
+    edges.push([Math.round(b.endMin), b.top + b.height]);
   }
+  const edgeLabels = [];
+  for (const [m, top] of edges.slice().sort((a, b) => a[1] - b[1])) {
+    if (near(m)) continue;
+    if (edgeLabels.some((e) => Math.abs(e.top - top) < 12)) continue;   // 붙어 있는 시작/종료 라벨은 하나만
+    edgeLabels.push({ m, top });
+  }
+  let labels = flow.ticks.map((t) => `<span class="hlabel" style="top:${t.top}px">${hhmm(t.min)}</span>`).join("")
+    + edgeLabels.map((e) => `<span class="hlabel edge" style="top:${e.top}px">${hhmm(e.m)}</span>`).join("");
 
   let lines = flow.ticks.map((t) => `<span class="hline" style="top:${t.top}px"></span>`).join("");
   const first = flow.blocks[0];
