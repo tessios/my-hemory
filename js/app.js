@@ -4,13 +4,15 @@ import { drive, AuthError } from "./drive.js";
 import { store } from "./store.js";
 import { buildIndex, search as doSearch, evidence, keywords, highlight } from "./search.js";
 import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./qa.js";
-import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange } from "./record.js";
+import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground } from "./record.js";
 import { FlipWatcher } from "./flip.js";
 import {
   previewLine, segmentRangeLabel, segmentDue, groupTranscript, silentVerdict, recordSegmentLabel, SEGMENT_SEC,
+  timelineFlow, weekDays, dateKeyOf, blockRangeLabel, CATEGORY_WORD, minutesOf, hhmm,
 } from "./pure.js";
+import { sensorResumePlan, sensorQuietLabel, SENSOR_QUIET_MS } from "./lifecycle.js";
 import {
-  $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, fmtMonth, dayKey, relDay,
+  $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, fmtMonth, dayKey, relDay, fmtMoment,
   toast, haptic, debounce, uid, stamp, localSettings, saveSettings, sleep,
 } from "./util.js";
 
@@ -28,11 +30,13 @@ const S = {
   recorder: new Recorder(),
   recordingSheet: null,
   sheet: null,
+  day: dateKeyOf(new Date()),                 // 타임라인이 보여 주는 날
   auto: { on: false, pending: false, failAt: 0, startedAt: 0, type: "work", timer: null, gestureBound: false },
   sel: { on: false, ids: new Set() },          // 타임라인 선택 모드
   seg: { index: 0, startAt: 0, timer: null, type: "work" },  // 30분 세그먼트
   segSession: null,                            // 로컬 적립 중인 녹음 세션 메타
-  mic: { warn: false, denied: false, nextTry: 0, armed: false, releasedOnHide: false },   // 마이크 연결 유지 감시
+  mic: { warn: false, denied: false, nextTry: 0, armed: false, resumeAt: 0 },   // 마이크 연결 유지 감시
+  week: [],                                    // 현재 주간 바
 };
 
 /* ── 예약 녹음(요일·시간) ─────────────────────────────── */
@@ -137,14 +141,13 @@ async function ensureMicStandby({ gesture = false, tryAnyway = false } = {}) {
   if (S.recorder.state === "recording" || S.recorder.state === "paused") return true;
   const st = micStatus();
   if (st.live) {
-    if (S.mic.warn || S.mic.releasedOnHide) { S.mic.warn = false; S.mic.denied = false; S.mic.releasedOnHide = false; renderFlipChip(); }
+    if (S.mic.warn || S.mic.denied) { S.mic.warn = false; S.mic.denied = false; renderFlipChip(); }
     return true;
   }
   // 이번 실행에서 아직 허용 전(idle)이거나 차단됨이면, 제스처 없이 iOS 에 권한 질문을 던지지 않는다.
   //   → '탭해서 마이크 연결'로 알리고 다음 터치에서 연다.
-  //   이번 실행에서 열었던 트랙이 끊긴 것(interrupted·lost)이거나, 방금 우리가 백그라운드에서 닫은 것이면
-  //   권한은 살아 있으니 조용히 다시 잡아 본다.
-  const recoverable = st.state === "interrupted" || st.state === "lost" || !!S.mic.releasedOnHide;
+  //   이번 실행에서 열었던 트랙이 끊긴 것(interrupted·lost)이면 권한은 살아 있으니 조용히 다시 잡아 본다.
+  const recoverable = st.state === "interrupted" || st.state === "lost";
   if (!gesture && !recoverable && !tryAnyway) {
     S.mic.denied = st.state === "denied";
     armMicGesture();
@@ -156,16 +159,101 @@ async function ensureMicStandby({ gesture = false, tryAnyway = false } = {}) {
     if (S.mic.warn) {
       toast("마이크를 다시 연결했습니다 · 폰을 엎으면 바로 녹음됩니다", 2400);
     }
-    S.mic.warn = false; S.mic.denied = false; S.mic.releasedOnHide = false;
+    S.mic.warn = false; S.mic.denied = false;
     renderFlipChip();
     return true;
   }
   S.mic.warn = true;
   S.mic.denied = r.reason === "denied";
-  S.mic.releasedOnHide = false;
   if (!gesture) armMicGesture();
   renderFlipChip();
   return false;
+}
+
+/* 마지막 녹음 시작 시각 — 상단 바의 '마지막 시작 ...' */
+function noteRecordingStart(at = new Date().toISOString()) {
+  saveSettings({ lastStart: at });
+  paintLastStart();
+}
+function paintLastStart() {
+  const el = $("#last-start");
+  if (!el) return;
+  const at = localSettings().lastStart;
+  el.textContent = at ? fmtMoment(at) : "아직 없음";
+}
+
+/* ── 앱을 떠났다 돌아오기 (v1.5) ─────────────────────────────
+   돌아왔을 때 **다시 묻지 않고** 이어 쓰는 것이 목표다.
+   · 마이크: 대여 중인 트랙이 살아 있으면 그대로, 끊겼으면 조용히 다시 연다.
+   · 센서: 권한은 페이지 단위라 그대로다 — 리스너만 다시 건다.
+   · 녹음 중이었다면: 살아 있으면 계속, 끊겼으면 담긴 데까지 저장한다. */
+let _resumeBusy = false;
+async function resumeAfterBackground() {
+  if (S.mode !== "live" || _resumeBusy) return;
+  _resumeBusy = true;
+  try {
+    if (S.recorder.state === "recording" || S.recorder.state === "paused") {
+      await resumeRecordingAfterBackground();
+      renderFlipChip();
+      return;
+    }
+
+    if (faceDownPref() && (flip.armed || flip.probe)) {
+      const plan = sensorResumePlan({
+        perm: flip.perm, listening: flip.listening, armed: flip.armed, probe: flip.probe,
+        hasSignal: flip.hasSignal, quietMs: flip.signalAgeMs,
+      });
+      if (plan === "restart") flip.resume();
+      else if (plan === "need-tap") armFlipPermission();
+    }
+
+    if (micStatus().held) {
+      const r = await resumeMicAfterBackground();
+      if (r.ok) { S.mic.warn = false; S.mic.denied = false; }
+      else if (r.action === "gesture") {
+        S.mic.denied = r.reason === "denied";
+        S.mic.warn = !S.mic.denied;
+        if (faceDownPref() && recorderIdle()) armMicGesture();
+      }
+    } else if (faceDownPref() && recorderIdle()) {
+      armMicGesture();            // 이번 실행에서 아직 연 적이 없다 — 첫 터치에서 연다(프롬프트 억제)
+    }
+
+    renderFlipChip();
+    paintFlipReadout();
+    scheduleSensorQuietCheck();
+  } finally { _resumeBusy = false; }
+}
+
+async function resumeRecordingAfterBackground() {
+  const R = S.recorder;
+  if (micStatus().live) {
+    try { await R.ctx?.resume?.(); } catch {}
+    R.ctxRunning = R.ctx?.state === "running";
+    return;
+  }
+  const r = await resumeMicAfterBackground();
+  if (r.ok && micStatus().live) {
+    try { await R.ctx?.resume?.(); } catch {}
+    R.ctxRunning = R.ctx?.state === "running";
+    return;
+  }
+  await rescueRecording("resume");   // 끊긴 뒤에는 담긴 데까지 저장(빈 파일·깨진 파일 방지)
+}
+
+/* 복귀 뒤 센서가 1초 넘게 조용하면 '탭해서 재개'로 안내 */
+let _quietTimer = null;
+function scheduleSensorQuietCheck() {
+  clearTimeout(_quietTimer);
+  if (!faceDownPref()) return;
+  _quietTimer = setTimeout(() => {
+    if (document.visibilityState !== "visible") return;
+    if (!(flip.armed || flip.probe) || flip.state === "active") return;
+    if (flip.hasSignal) return;
+    renderFlipChip();
+    const label = sensorQuietLabel({ perm: flip.perm, listening: flip.listening, hasSignal: flip.hasSignal, quietMs: flip.signalAgeMs, armed: flip.armed });
+    if (label) toast(`${label} · 아래 칩을 한 번 탭하세요`, 2800);
+  }, SENSOR_QUIET_MS + 400);
 }
 
 /* 마이크가 끊긴 뒤에는 '다음 터치'에서 사용자 제스처와 함께 다시 연다 */
@@ -247,6 +335,7 @@ async function startFaceRecording() {
   S.face.active = true;
   S.face.startedAt = Date.now();
   S.face.pending = false;
+  noteRecordingStart(new Date(S.face.startedAt).toISOString());
   beginLocalSession({ title: `뒤집어 녹음 ${fmtTime(new Date().toISOString())}`, type: "work" });
   startSegTimer("work", S.face.startedAt);
   if (!flip.active) flip.adopt();     // 탭으로 시작한 경우에도 들면 자동 저장되도록
@@ -452,9 +541,7 @@ function renderFlipChip() {
   el.dataset.state = flip.state;
   const m = micStatus();
   el.dataset.mic = flip.state === "active" || m.live ? "live" : S.mic.denied || m.state === "denied" ? "denied" : "lost";
-  let label = flip.state === "need-tap" ? "탭해서 센서 연결"
-    : flip.state === "nosignal" ? "센서 신호 없음 · 탭해서 다시 연결"
-    : flip.label;
+  let label = flip.state === "need-tap" && flip.perm === "unknown" ? "탭해서 센서 연결" : flip.label;
   // 센서는 준비됐는데 마이크가 없다면 그 사실을 먼저 알린다(v1.4.1)
   if (flip.state !== "active" && faceDownPref() && !m.live) {
     label = S.mic.denied || m.state === "denied" ? "마이크 권한 차단됨 · 설정에서 허용"
@@ -607,9 +694,28 @@ function bindGlobal() {
   $("#btn-gate-setup").addEventListener("click", openSetupSheet);
 
   $$("#tabbar button").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
-  $("#btn-sync").addEventListener("click", () => syncNow({ manual: true }));
-  $("#btn-select")?.addEventListener("click", () => setSelectMode(!S.sel.on));
+  $("#btn-menu")?.addEventListener("click", openMenuSheet);
+  $("#btn-listen")?.addEventListener("click", () => { unlockAudio(); openRecorder(); });
+  $("#btn-today")?.addEventListener("click", gotoToday);
+  $("#dn-month")?.addEventListener("click", openDayPicker);
+  $("#btn-settings-back")?.addEventListener("click", () => setTab("timeline"));
   $("#fab").addEventListener("click", openRecorder);
+
+  // 에이전트 탭
+  $("#ask-run")?.addEventListener("click", async () => {
+    const inp = $("#ask-input");
+    const q = (inp?.value || "").trim();
+    if (!q) { inp?.focus(); return toast("궁금한 것을 적어 주세요"); }
+    await askInto($("#ask-body"), q);
+  });
+  $("#ask-input")?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $("#ask-run")?.click(); }
+  });
+  $$("#agent-links .alink").forEach((b) => b.addEventListener("click", () => {
+    setTab("settings");
+    const id = b.dataset.scroll;
+    setTimeout(() => document.getElementById(id)?.scrollIntoView({ block: "start", behavior: "smooth" }), 80);
+  }));
 
   // 검색
   $("#q").addEventListener("input", debounce((e) => { S.query = e.target.value; renderSearch(); }, 120));
@@ -653,36 +759,30 @@ function bindGlobal() {
   addRecListener(renderAutoBar);
   addRecListener(updateSleepOverlay);
 
-  /* 화면이 가려지기 전까지 모인 소리는 잃지 않게 저장 */
+  /* ── 앱을 떠났다 돌아오기 (v1.5) ───────────────────────────
+     떠날 때: 녹음 중이면 지금까지를 저장한다(iOS 는 백그라운드에서 캡처를 멈춘다).
+     **마이크는 닫지 않는다** — 닫으면 iOS 가 권한을 풀어 복귀 때 다시 묻게 된다.
+     돌아올 때: 살아 있으면 아무 것도 하지 않고, 끊겼으면 조용히 복구한다. */
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
       rescueRecording("hidden");
-      // 백그라운드에서는 어차피 녹음을 시작할 수 없다 — iOS 가 오디오 세션을 잡고 있지 않게 마이크를 닫는다
-      if (S.recorder.state === "idle" || S.recorder.state === "done") {
-        S.mic.releasedOnHide = micStatus().held;
-        releaseMic();
-      }
+      markBackgrounded();          // 스트림은 그대로 들고 간다(대여 유지)
     } else {
       schedTick(); renderAutoBar(); resumeConnection();
-      // 앱으로 돌아오면 센서 감시를 다시 건다(백그라운드에서 브라우저가 리스너를 쉬게 한다)
-      if (faceDownPref()) {
-        if (!flip.granted) armFlipPermission();
-        else if (!flip.listening) flip.start();
-        ensureMicStandby();          // 돌아오자마자 마이크도 조용히 다시 연결(v1.4.1)
-      }
+      resumeAfterBackground();
       renderFlipChip();
     }
   });
-  window.addEventListener("pagehide", () => { rescueRecording("pagehide"); });
+  window.addEventListener("pagehide", () => { rescueRecording("pagehide"); markBackgrounded(); });
   window.addEventListener("pageshow", (e) => {
-    // bfcache 로 돌아온 경우: 센서·마이크 연결을 다시 확인한다
-    if (!e.persisted) return;
-    if (faceDownPref()) {
-      if (!flip.granted) armFlipPermission();
-      else if (!flip.listening) flip.start();
-    }
-    renderFlipChip();
+    // bfcache·프로세스 재개로 돌아온 경우: 권한을 다시 묻지 않고 감시만 되살린다
+    if (!e.persisted) { renderFlipChip(); return; }
+    resumeAfterBackground();
   });
+  // focus 는 visibilitychange 를 놓치는 경우(데스크톱·안드로이드 브라우저)의 보조 신호
+  window.addEventListener("focus", debounce(() => {
+    if (document.visibilityState === "visible") resumeAfterBackground();
+  }, 700));
 
   /* 절전 오버레이를 탭하면 바로 종료·저장(시작이 막혀 있으면 시작) */
   $("#sleep-overlay")?.addEventListener("click", () => {
@@ -706,7 +806,19 @@ function bindGlobal() {
       return;
     }
     if (!flip.listening) { flip.start(); renderFlipChip(); toast("센서 감시를 다시 켰습니다", 1600); return; }
-    // 마이크가 끊겨 있으면 이 탭으로 바로 다시 연다(v1.4.1)
+    // 허용된 상태인데 이벤트가 멈춰 있을 때(백그라운드 복귀 등): 이 탭으로 리스너를 다시 걸고 권한을 재확인한다.
+    //   이미 허용된 권한이라 프롬프트는 뜨지 않는다.
+    if (!flip.hasSignal) {
+      await flip.reanimate();
+      renderFlipChip();
+      setTimeout(() => {
+        if (flip.hasSignal) { toast("센서를 다시 붙였습니다 · 폰을 엎어 보세요", 2000); return; }
+        setTab("settings");
+        setTimeout(() => $("#sgroup-flip")?.scrollIntoView({ block: "center", behavior: "smooth" }), 60);
+      }, 900);
+      return;
+    }
+    // 마이크가 끊겨 있으면 이 탭으로 바로 다시 연다
     if (!micStatus().live && !S.face.active) {
       const ok = await ensureMicStandby({ gesture: true });
       if (ok) { toast("마이크를 연결했습니다 · 폰을 엎어 보세요", 1800); return; }
@@ -720,12 +832,13 @@ function bindGlobal() {
   /* 마이크 연결 유지 감시(v1.4.1) — 엎기 대기 중에 트랙이 조용해졌으면 다시 잡는다.
      실패하면 간격을 늘려 iOS 에 권한 질문을 연속으로 던지지 않는다. */
   onMicChange(() => { renderFlipChip(); paintFlipReadout(); });
+/* 엎어 대기 중 마이크가 조용해지면 다시 잡는다. 녹음 중이거나 화면이 가려져 있으면 건드리지 않는다. */
   setInterval(() => {
     if (S.mode !== "live" || !faceDownPref()) return;
     if (document.visibilityState !== "visible") return;
     if (!recorderIdle()) return;
-    if (Date.now() < (S.mic.nextTry || 0)) return;
     if (micStatus().live) return;
+    if (Date.now() < (S.mic.nextTry || 0)) return;
     S.mic.nextTry = Date.now() + 8000;
     ensureMicStandby().then((ok) => { if (!ok) S.mic.nextTry = Date.now() + 20000; });
   }, 5000);
@@ -763,7 +876,9 @@ function setTab(tab) {
   showScreen(tab);
   $("#fab").hidden = tab !== "timeline";
   if (tab === "timeline") renderTimeline();
-  if (tab === "search") { renderSearch(); setTimeout(() => $("#q").focus(), 120); }
+  if (tab === "search") { renderSearch(); }
+  if (tab === "people") renderPeople();
+  if (tab === "agent") { renderAgent(); setTimeout(() => $("#ask-input")?.focus(), 120); }
   if (tab === "settings") renderSettings();
   else if (typeof flip !== "undefined") flip.setProbe(false);
   renderFlipChip();
@@ -796,7 +911,7 @@ async function enterLive() {
     reindex();
     renderTimeline();
   } else {
-    $("#tl-list").innerHTML = '<div class="loading"><span class="spinner dark"></span></div>';
+    $("#dayview").innerHTML = '<div class="loading"><span class="spinner dark"></span></div>';
   }
   setTab("timeline");
   applyDeepLink();
@@ -852,7 +967,7 @@ function normalizeDemo(r, i) {
 async function syncNow({ manual = false } = {}) {
   if (S.mode !== "live" || S.syncState === "syncing") return;
   S.syncState = "syncing";
-  $("#btn-sync").classList.add("spin");
+  syncSpin(true);
   try {
     const { files } = await drive.listTree();
     const audioRe = /\.(m4a|mp3|wav|aac|caf|ogg|opus|webm)$/i;
@@ -900,13 +1015,13 @@ async function syncNow({ manual = false } = {}) {
     await store.setKV("lastSync", S.lastSync).catch(() => {});
     flushPending().catch(() => {});
     S.syncState = "idle";
-    $("#btn-sync").classList.remove("spin");
+    syncSpin(false);
     renderTimeline();
     if (S.tab === "search") renderSearch();
     if (manual) toast(`동기화 완료 · 기록 ${S.records.length}건`);
   } catch (e) {
     S.syncState = "idle";
-    $("#btn-sync").classList.remove("spin");
+    syncSpin(false);
     if (e instanceof AuthError) {
       // 토큰이 만료된 것이지 로그아웃된 것이 아니다. 첫 화면으로 돌아가지 않는다.
       if (e.code === "needs_reconnect") showConnBar(e.code);
@@ -1026,15 +1141,21 @@ function typeChips(counts) {
 }
 
 function filteredRecords() {
-  return S.filter === "all" ? S.records : S.records.filter((r) => r.type === S.filter);
+  const day = recordsOnDay(S.day);
+  return S.filter === "all" ? day : day.filter((r) => r.type === S.filter);
 }
 
 function setSelectMode(on) {
   S.sel.on = !!on;
   S.sel.ids.clear();
-  const b = $("#btn-select");
-  if (b) { b.classList.toggle("on", S.sel.on); b.textContent = S.sel.on ? "완료" : "선택"; }
   renderTimeline();
+  if (S.sel.on) toast("블록을 눌러 선택하세요", 1800);
+}
+
+/* 동기화 중 표시 — 상단 메뉴 버튼 옆 회전 */
+function syncSpin(on) {
+  const b = $("#btn-menu");
+  if (b) b.classList.toggle("spin", !!on);
 }
 
 function toggleSel(id) {
@@ -1112,49 +1233,124 @@ async function deleteRecords(list) {
   else toast(`${done.size}개 삭제했습니다`);
 }
 
-function renderTimeline() {
-  const list = $("#tl-list");
-  if (!S.records.length) {
-    $("#tl-month").textContent = "기록";
-    $("#tl-sub").textContent = "아직 기록이 없습니다";
-    $("#tl-chips").innerHTML = "";
-    list.innerHTML = `<div class="empty"><h3>아직 기록이 없습니다</h3><p>아래 녹음 버튼으로 짧게 남기거나,<br>아이폰 음성 메모를 <b>${esc(CONFIG.rootFolder)}</b> 폴더에<br>올리면 맥이 자동으로 전사합니다.</p></div>`;
-    return;
-  }
-  const counts = {};
-  S.records.forEach((r) => { counts[r.type] = (counts[r.type] || 0) + 1; });
-  const filtered = S.filter === "all" ? S.records : S.records.filter((r) => r.type === S.filter);
+/* ────────────────────────────────── 타임라인 ── */
+function recordsOnDay(key) {
+  return S.records
+    .filter((r) => dayKey(r.started_at) === key)
+    .sort((a, b) => new Date(a.started_at) - new Date(b.started_at));
+}
 
-  const total = S.records.reduce((a, r) => a + (r.duration_sec || 0), 0);
-  const newest = S.records[0];
-  $("#tl-month").textContent = fmtMonth(newest.started_at);
-  $("#tl-sub").textContent = `기록 ${S.records.length}건 · ${fmtDuration(total)}${S.mode === "demo" ? " · 데모" : ""}`;
-  $("#tl-chips").innerHTML = typeChips(counts);
+function dotsFor(key) {
+  return Math.min(3, recordsOnDay(key).length);
+}
 
-  if (!filtered.length) {
-    list.innerHTML = `<div class="empty"><h3>해당 유형의 기록이 없습니다</h3><p>다른 유형을 선택해 보세요.</p></div>`;
-    return;
-  }
-
-  let html = "";
-  let lastDay = "";
-  for (const r of filtered) {
-    const dk = dayKey(r.started_at);
-    if (dk !== lastDay) {
-      const rel = relDay(r.started_at);
-      html += `<div class="daylabel"><b>${esc(fmtDay(r.started_at))}</b>${rel ? `<span>${rel}</span>` : ""}</div>`;
-      lastDay = dk;
-    }
-    html += cardHTML(r);
-  }
-  list.innerHTML = html;
-  maybeShowInstallTip();
-
-  $$("#tl-chips .chip").forEach((c) => c.addEventListener("click", () => {
-    S.filter = c.dataset.f; renderTimeline();
+function renderWeek() {
+  const strip = $("#weekstrip");
+  if (!strip) return;
+  const today = dateKeyOf(new Date());
+  S.week = weekDays(S.day, 7);
+  strip.innerHTML = S.week.map((d) => {
+    const on = d.key === S.day;
+    const n = dotsFor(d.key);
+    return `<button class="wd ${on ? "on" : ""} ${d.key === today ? "today" : ""}" data-day="${d.key}" role="tab" aria-selected="${on}">
+      <span class="wd-dow">${DAY_LABELS[d.dow]}</span>
+      <span class="wd-day">${d.day}</span>
+      <span class="wd-dots">${Array.from({ length: n }, () => "<i></i>").join("")}</span>
+    </button>`;
+  }).join("");
+  $$("#weekstrip .wd").forEach((b) => b.addEventListener("click", () => {
+    if (S.sel.on) setSelectMode(false);
+    S.day = b.dataset.day;
+    renderTimeline();
   }));
-  $$("#tl-list .card").forEach((c) => c.addEventListener("click", () => {
-    const rec = S.records.find((r) => r.id === c.dataset.id);
+}
+
+function renderDayHeader() {
+  const [y, m] = String(S.day).split("-");
+  const el = $("#dn-month-text");
+  if (el) el.textContent = `${y} / ${String(Number(m)).padStart(2, "0")}`;
+  const t = $("#btn-today");
+  if (t) t.classList.toggle("on", S.day === dateKeyOf(new Date()));
+}
+
+/* 블록 하단 정보 — 화자/전사 상태 */
+function blockFoot(rec) {
+  if (rec.status === "pending") return "전사 대기 · 맥이 처리하면 요약이 채워집니다";
+  const sp = rec.speakers || [];
+  const segs = rec.segments || [];
+  if (sp.length) return `화자 ${sp.length}명 · ${sp.slice(0, 3).join(" · ")}${sp.length > 3 ? ` 외 ${sp.length - 3}명` : ""}`;
+  if (segs.length) return `화자 미확인 · 문장 ${segs.length}개`;
+  return `기록 ${fmtDuration(rec.duration_sec || 0)}`;
+}
+
+function renderDay() {
+  const view = $("#dayview");
+  if (!view) return;
+  const recs = recordsOnDay(S.day);
+  const status = $("#tl-status");
+  if (status) {
+    if (S.mode === "demo") {
+      status.hidden = false;
+      status.innerHTML = `데모 기록 <b>${recs.length}건</b> · 실제 저장은 되지 않습니다`;
+    } else { status.hidden = true; status.innerHTML = ""; }
+  }
+
+  if (!recs.length) {
+    // 빈 날: 06:00~22:00 눈금만
+    const top = 10, step = 46, from = 6, to = 22;
+    let html = `<div class="grid" style="height:${(to - from) * step + 46}px"><div class="hlabels">`;
+    for (let h = from; h <= to; h++) html += `<span class="hlabel" style="top:${(h - from) * step + top}px">${String(h).padStart(2, "0")}:00</span>`;
+    html += `</div><div class="canvas"><span class="spine" style="top:${top}px;height:${(to - from) * step}px;opacity:.18"></span>`;
+    for (let h = from; h <= to; h++) html += `<span class="hline" style="top:${(h - from) * step + top}px"></span>`;
+    html += `<div class="day-empty"><b>이 날은 기록이 없습니다</b>아래 버튼으로 녹음을 시작하거나<br>아이폰 음성 메모를 올리면 여기에 쌓입니다.</div>`;
+    html += `</div></div>`;
+    view.innerHTML = html;
+    return;
+  }
+
+  const flow = timelineFlow(recs.map((r) => ({
+    id: r.id,
+    startMin: minutesOf(r.started_at),
+    durationSec: r.duration_sec || 0,
+  })));
+  const byId = new Map(recs.map((r) => [r.id, r]));
+
+  /* 시간 눈금: 흐름의 정시 눈금 + 블록의 실제 시작/종료(정시 눈금과 겹치면 생략) */
+  let labels = flow.ticks.map((t) => `<span class="hlabel" style="top:${t.top}px">${hhmm(t.min)}</span>`).join("");
+  const near = (m) => flow.ticks.some((t) => Math.abs(t.min - m) <= 14);
+  for (const b of flow.blocks) {
+    for (const [m, top] of [[Math.round(b.startMin), b.top], [Math.round(b.endMin), b.top + b.height]]) {
+      if (near(m)) continue;
+      labels += `<span class="hlabel edge" style="top:${top}px">${hhmm(m)}</span>`;
+    }
+  }
+
+  let lines = flow.ticks.map((t) => `<span class="hline" style="top:${t.top}px"></span>`).join("");
+  const first = flow.blocks[0];
+  const last = flow.blocks[flow.blocks.length - 1];
+  lines += `<span class="spine" style="top:${first.top}px;height:${last.top + last.height - first.top}px"></span>`;
+
+  const blocks = flow.blocks.map((b) => {
+    const r = byId.get(b.id);
+    const t = TYPES[r.type] || TYPES.etc;
+    const short = b.height < 124;
+    const picked = S.sel.ids.has(r.id);
+    return `<button class="blk ${r.status === "pending" ? "pending" : ""} ${picked ? "on" : ""}" data-id="${esc(r.id)}" data-short="${short ? 1 : 0}" style="top:${b.top}px;height:${b.height}px">
+      <span class="blk-range">${esc(blockRangeLabel(r.started_at, r.duration_sec))}</span>
+      <span class="blk-wm">${CATEGORY_WORD[r.type] || "ETC"}</span>
+      <span class="blk-title">${esc(r.title || "제목 없는 기록")}</span>
+      <span class="blk-foot"><span class="blk-cat">${esc(t.label)}</span>${esc(blockFoot(r))}</span>
+      ${S.sel.on ? `<span class="ck" aria-hidden="true">${picked ? "✓" : ""}</span>` : ""}
+    </button>`;
+  }).join("");
+
+  view.innerHTML = `<div class="grid" style="height:${flow.height}px">
+    <div class="hlabels">${labels}</div>
+    <div class="canvas">${lines}${blocks}</div>
+  </div>`;
+
+  $$("#dayview .blk").forEach((el) => el.addEventListener("click", () => {
+    const rec = S.records.find((r) => r.id === el.dataset.id);
     if (!rec) return;
     if (S.sel.on) { toggleSel(rec.id); return; }
     openDetail(rec);
@@ -1162,33 +1358,26 @@ function renderTimeline() {
   renderSelBar();
 }
 
-function cardHTML(r) {
+function renderTimeline() {
+  renderDayHeader();
+  renderWeek();
+  renderDay();
+  paintLastStart();
+  maybeShowInstallTip();
+}
+
+/* 활동 탭의 목록 한 줄 */
+function feedRowHTML(r) {
   const t = TYPES[r.type] || TYPES.etc;
-  const pending = r.status === "pending";
   const line = previewLine(r);
-  const segLabel = recordSegmentLabel(r);
-  const spk = (r.speakers || []).length;
-  const metaBits = [];
-  if (r.duration_sec) metaBits.push(fmtDuration(r.duration_sec));
-  if (spk > 1) metaBits.push(`화자 ${spk}`);
-  if (r.source === "iphone") metaBits.push("음성메모");
-  else if (r.source === "web") metaBits.push("웹 녹음");
-  else if (r.source === "mic") metaBits.push("웹 녹음");
-  if (pending) metaBits.push("전사 대기");
-  const picked = S.sel.ids.has(r.id);
-  return `<button class="card ${pending ? "pending" : ""} ${S.sel.on ? "selectable" : ""} ${picked ? "on" : ""}" data-id="${esc(r.id)}">
-    ${S.sel.on ? `<span class="ck" aria-hidden="true">${picked ? "✓" : ""}</span>` : ""}
-    <div class="card-time">${esc(fmtTime(r.started_at))}</div>
-    <div>
-      <div class="card-top">
-        <span class="tag ${r.type === "meeting" ? "meeting" : ""}">${esc(t.label)}</span>
-        ${segLabel ? `<span class="tag seg">${esc(segLabel)}</span>` : ""}
-        ${pending ? '<span class="tag pending">전사 대기</span>' : ""}
-      </div>
-      <h3 class="card-title">${esc(r.title)}</h3>
-      ${line ? `<p class="card-line">${esc(line)}</p>` : ""}
-      <div class="card-meta">${metaBits.map((m) => `<span>${esc(m)}</span>`).join("")}</div>
-    </div>
+  const pending = r.status === "pending";
+  return `<button class="frow" data-id="${esc(r.id)}">
+    <span class="frow-time">${esc(fmtTime(r.started_at))}</span>
+    <span class="frow-main">
+      <span class="frow-top"><span class="tag ${r.type === "meeting" ? "meeting" : ""}">${esc(t.label)}</span>${pending ? '<span class="tag pending">전사 대기</span>' : ""}<span class="frow-date">${esc(fmtDay(r.started_at))}</span></span>
+      <b class="frow-title">${esc(r.title || "제목 없는 기록")}</b>
+      ${line ? `<span class="frow-line">${esc(line)}</span>` : ""}
+    </span>
   </button>`;
 }
 
@@ -1215,14 +1404,21 @@ function renderSearch() {
   }
 
   if (!q) {
+    const list = S.filter === "all" ? S.records : S.records.filter((r) => r.type === S.filter);
+    if (!list.length) {
+      body.innerHTML = `<div class="empty"><h3>아직 기록이 없습니다</h3><p>타임라인에서 녹음을 시작하거나,<br>아이폰 음성 메모를 <b>${esc(CONFIG.rootFolder)}</b> 폴더에 올려 보세요.</p></div>`;
+      return;
+    }
     const kw = keywords(S.index, 8);
-    body.innerHTML = `<div class="empty" style="padding-top:34px">
-      <h3>기억나지 않는 말을 찾아보세요</h3>
-      <p>전사된 모든 문장과 요약을 즉시 검색합니다.<br>검색어는 띄어쓰기가 달라도 찾습니다.</p>
-      ${kw.length ? `<div class="chips" style="justify-content:center;padding:18px 4px 0;flex-wrap:wrap">${kw.map((k) => `<button class="chip" data-kw="${esc(k)}">${esc(k)}</button>`).join("")}</div>` : ""}
-    </div>`;
+    body.innerHTML = `<div class="search-hint">최근 기록 ${list.length}건 · 요약</div>
+      <div class="feed">${list.slice(0, 40).map(feedRowHTML).join("")}</div>
+      ${kw.length ? `<div class="chips" style="flex-wrap:wrap;padding:16px 12px 0">${kw.map((k) => `<button class="chip" data-kw="${esc(k)}">${esc(k)}</button>`).join("")}</div>` : ""}`;
     $$("#search-body [data-kw]").forEach((b) => b.addEventListener("click", () => {
       S.query = b.dataset.kw; $("#q").value = S.query; renderSearch();
+    }));
+    $$("#search-body .frow").forEach((b) => b.addEventListener("click", () => {
+      const rec = S.records.find((r) => r.id === b.dataset.id);
+      if (rec) openDetail(rec);
     }));
     return;
   }
@@ -1255,7 +1451,12 @@ function renderSearch() {
 async function runAsk() {
   const q = S.query.trim();
   if (!q) return;
-  const body = $("#search-body");
+  await askInto($("#search-body"), q);
+}
+
+/* 질문 → 근거 → (Gemini 키가 있으면) 답변. 활동 탭과 에이전트 탭이 같은 함수를 쓴다. */
+async function askInto(body, q) {
+  if (!body) return;
   const hits = evidence(S.index, q, 10);
   if (!hits.length) {
     body.innerHTML = `<div class="empty"><h3>관련 기록을 찾지 못했습니다</h3><p>질문에 나온 낱말로 검색되는 문장이 없습니다.</p></div>`;
@@ -1270,7 +1471,7 @@ async function runAsk() {
       <div class="ask-a" style="color:var(--muted)">설정에서 Gemini API 키를 넣으면 이 근거들로 답변을 만들어 드립니다. 지금은 가장 관련 있는 문장을 모았습니다.</div>
       ${srcHTML}
     </div></div>`;
-    bindAskSources();
+    bindAskSources(body);
     return;
   }
 
@@ -1288,14 +1489,181 @@ async function runAsk() {
       <div class="ask-a" style="color:var(--muted)">답변을 만들지 못했습니다: ${esc(e.message || "오류")}</div>
       ${srcHTML}</div></div>`;
   }
-  bindAskSources();
+  bindAskSources(body);
 }
 
-function bindAskSources() {
-  $$("#search-body .src").forEach((b) => b.addEventListener("click", () => {
+function bindAskSources(root = document) {
+  $$(".src", root).forEach((b) => b.addEventListener("click", () => {
     const rec = S.records.find((r) => r.id === b.dataset.rid);
     if (rec) openDetail(rec, { seek: b.dataset.t ? Number(b.dataset.t) : null });
   }));
+}
+
+/* ────────────────────────────────── 인물 ── */
+function speakerIndex() {
+  const map = new Map();
+  const touch = (name) => {
+    let p = map.get(name);
+    if (!p) { p = { name, records: new Set(), segs: 0, last: 0, lines: [] }; map.set(name, p); }
+    return p;
+  };
+  for (const r of S.records) {
+    const sp = r.speakers || [];
+    const ts = new Date(r.started_at).getTime() || 0;
+    const seen = new Set();
+    for (const s of r.segments || []) {
+      const name = s.speaker || (sp.length === 1 ? sp[0] : "");
+      if (!name) continue;
+      const p = touch(name);
+      p.records.add(r.id);
+      p.segs += 1;
+      p.last = Math.max(p.last, ts);
+      p.lines.push({ rec: r, t: s.start, text: s.text });
+      seen.add(name);
+    }
+    for (const name of sp) {
+      if (seen.has(name)) continue;
+      const p = touch(name);
+      p.records.add(r.id);
+      p.last = Math.max(p.last, ts);
+    }
+  }
+  return [...map.values()].sort((a, b) => b.last - a.last || b.segs - a.segs);
+}
+
+function initialOf(name = "") {
+  const s = String(name).trim();
+  if (!s) return "?";
+  if (/^[A-Za-z]/.test(s)) return s.slice(0, 2).toUpperCase();
+  return s.slice(0, 1);
+}
+
+function renderPeople() {
+  const list = $("#people-list");
+  const sum = $("#people-sum");
+  if (!list) return;
+  const people = speakerIndex();
+  const unknown = S.records.filter((r) => !(r.speakers || []).length && (r.segments || []).length).length;
+  if (sum) sum.innerHTML = `<span><b>${people.length}</b>명의 화자</span><span><b>${S.records.length}</b>개 기록</span>${unknown ? `<span><b>${unknown}</b>건 화자 미확인</span>` : ""}`;
+  if (!people.length) {
+    list.innerHTML = `<div class="empty"><h3>아직 확인된 화자가 없습니다</h3><p>전사가 끝난 기록에서 화자 이름이 잡히면<br>여기에 사람별로 모입니다.</p></div>`;
+    return;
+  }
+  list.innerHTML = people.map((p) => `<button class="person" data-name="${esc(p.name)}">
+    <span class="avatar">${esc(initialOf(p.name))}</span>
+    <span class="p-main"><b>${esc(p.name)}</b><span>기록 ${p.records.size} · 문장 ${p.segs}${p.last ? ` · 최근 ${esc(fmtDay(new Date(p.last).toISOString()))}` : ""}</span></span>
+    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </button>`).join("");
+  $$("#people-list .person").forEach((b) => b.addEventListener("click", () => openPerson(b.dataset.name)));
+}
+
+function openPerson(name) {
+  const people = speakerIndex();
+  const p = people.find((x) => x.name === name);
+  if (!p) return;
+  const byRec = new Map();
+  for (const l of p.lines) {
+    if (!byRec.has(l.rec.id)) byRec.set(l.rec.id, { rec: l.rec, lines: [] });
+    byRec.get(l.rec.id).lines.push(l);
+  }
+  for (const rid of p.records) {
+    if (byRec.has(rid)) continue;
+    const rec = S.records.find((r) => r.id === rid);
+    if (rec) byRec.set(rid, { rec, lines: [] });
+  }
+  const rows = [...byRec.values()]
+    .sort((a, b) => new Date(b.rec.started_at) - new Date(a.rec.started_at))
+    .map(({ rec, lines }) => `<section class="detail-sec">
+      <h3>${esc(fmtDay(rec.started_at))} · ${esc(fmtTime(rec.started_at))} · ${esc(fmtDuration(rec.duration_sec || 0))}</h3>
+      <button class="p-line" data-rid="${esc(rec.id)}" style="width:100%;text-align:left;border:0;background:none;padding:6px 0">
+        <span style="font-size:13.5px;color:var(--ink);font-weight:600">${esc(rec.title || "제목 없는 기록")}</span>
+        ${lines.slice(0, 3).map((l) => `<span style="display:block;font-size:10.5px;color:var(--muted-2);margin-top:4px">${fmtClock(l.t || 0)}</span><span style="display:block;font-size:13px;line-height:1.55;color:var(--ink-2)">${esc(l.text)}</span>`).join("")}
+        ${lines.length > 3 ? `<span style="display:block;font-size:11px;color:var(--muted-2);margin-top:6px">외 ${lines.length - 3}문장</span>` : ""}
+      </button>
+    </section>`).join("");
+  const sheet = openSheet({
+    title: name,
+    sub: `<span>기록 ${p.records.size} · 문장 ${p.segs}</span>`,
+    body: rows || `<div class="empty"><h3>문장이 아직 없습니다</h3><p>이 기록은 전사 대기 중입니다.</p></div>`,
+    tall: true,
+  });
+  $$(".p-line", sheet).forEach((b) => b.addEventListener("click", () => {
+    const rec = S.records.find((r) => r.id === b.dataset.rid);
+    if (rec) openDetail(rec);
+  }));
+}
+
+/* ────────────────────────────────── 에이전트 ── */
+function renderAgent() {
+  const badge = $("#agent-badge");
+  if (badge) badge.textContent = hasGemini() ? "Gemini 연결됨" : "Gemini 키 없음";
+  const hint = $("#agent-hint");
+  if (hint) hint.textContent = hasGemini()
+    ? "근거가 된 문장과 함께 답합니다."
+    : "지금은 근거 문장만 모아 보여 줍니다 · 설정에서 Gemini 키를 넣으면 답변까지 만듭니다.";
+}
+
+/* ────────────────────────────────── 메뉴 · 날짜 고르기 ── */
+function openMenuSheet() {
+  const email = localStorage.getItem("hemory.email") || "";
+  const dayN = recordsOnDay(S.day).length;
+  const sheet = openSheet({
+    title: "메뉴",
+    sub: `<span>${esc(fmtDay(S.day + "T00:00:00"))}</span><span>기록 ${dayN}건</span>${S.mode === "demo" ? "<span>데모</span>" : ""}`,
+    body: `<div style="padding:4px 16px 8px">
+      ${email ? `<div class="srow"><span class="k">계정</span><span class="v">${esc(email)}</span></div>` : ""}
+      <button class="btn btn-line btn-block" id="menu-settings">설정 열기</button>
+      <button class="btn btn-line btn-block" id="menu-select">${S.sel.on ? "선택 끝내기" : "선택해서 삭제"}</button>
+      <button class="btn btn-line btn-block" id="menu-sync">지금 동기화</button>
+      <button class="btn btn-line btn-block" id="menu-today">오늘로 이동</button>
+      <button class="btn btn-ghost btn-block" id="menu-date">다른 날짜 고르기</button>
+      <p class="note">뒤집어 녹음 상태는 타임라인 아래 칩에서 바로 확인할 수 있습니다.</p>
+    </div>`,
+  });
+  $("#menu-settings", sheet).addEventListener("click", () => { closeSheet(); setTab("settings"); });
+  $("#menu-select", sheet).addEventListener("click", () => { closeSheet(); setSelectMode(!S.sel.on); });
+  $("#menu-sync", sheet).addEventListener("click", () => { closeSheet(); syncNow({ manual: true }); });
+  $("#menu-today", sheet).addEventListener("click", () => { closeSheet(); gotoToday(); });
+  $("#menu-date", sheet).addEventListener("click", () => { closeSheet(); openDayPicker(); });
+}
+
+function gotoToday() {
+  S.day = dateKeyOf(new Date());
+  renderTimeline();
+}
+
+function openDayPicker() {
+  let [yy, mm] = String(S.day).split("-").map(Number);
+  const sheet = openSheet({ title: "날짜 고르기", body: `<div id="cal-wrap" style="padding:6px 12px 0"></div>` });
+  const wrap = $("#cal-wrap", sheet);
+  const draw = () => {
+    const first = new Date(yy, mm - 1, 1);
+    const startDow = first.getDay();
+    const daysInMonth = new Date(yy, mm, 0).getDate();
+    const today = dateKeyOf(new Date());
+    let cells = "";
+    for (let i = 0; i < startDow; i++) cells += `<span></span>`;
+    for (let d = 1; d <= daysInMonth; d++) {
+      const key = `${yy}-${String(mm).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+      const n = recordsOnDay(key).length;
+      cells += `<button class="cal-day ${key === S.day ? "on" : ""} ${key === today ? "today" : ""}" data-day="${key}">${d}${n ? `<i></i>` : ""}</button>`;
+    }
+    wrap.innerHTML = `<div class="cal-head">
+        <button id="cal-prev" aria-label="이전 달">‹</button>
+        <b>${yy}년 ${mm}월</b>
+        <button id="cal-next" aria-label="다음 달">›</button>
+      </div>
+      <div class="cal-grid">${["일", "월", "화", "수", "목", "금", "토"].map((d) => `<span class="cal-dow">${d}</span>`).join("")}${cells}</div>
+      <p class="note" style="padding:0 6px 6px">점이 있는 날에 기록이 있습니다.</p>`;
+    $("#cal-prev", wrap).addEventListener("click", () => { mm--; if (mm < 1) { mm = 12; yy--; } draw(); });
+    $("#cal-next", wrap).addEventListener("click", () => { mm++; if (mm > 12) { mm = 1; yy++; } draw(); });
+    $$(".cal-day", wrap).forEach((b) => b.addEventListener("click", () => {
+      S.day = b.dataset.day;
+      closeSheet();
+      renderTimeline();
+    }));
+  };
+  draw();
 }
 
 /* ────────────────────────────────── 상세 ── */
@@ -1672,7 +2040,7 @@ async function renderSettings() {
   };
 
   body.innerHTML = `
-  <div class="sgroup">
+  <div class="sgroup" id="sgroup-account">
     <h2>계정</h2>
     <div class="srow"><span class="k">${S.mode === "live" ? "Google 드라이브 연결됨" : "연결 안 됨"}</span>
       <span class="v">${esc(email || (drive.signedIn ? "연결됨" : "—"))}</span></div>
@@ -1685,7 +2053,7 @@ async function renderSettings() {
     ${S.mode === "live" ? '<button class="btn btn-ghost btn-block" id="s-out">연결 해제</button>' : '<button class="btn btn-ghost btn-block" id="s-login">Google 연결</button>'}
   </div>
 
-  <div class="sgroup">
+  <div class="sgroup" id="sgroup-ai">
     <h2>AI</h2>
     <div class="srow"><span class="k">Gemini API 키</span><span class="v">${hasGemini() ? "설정됨" : "없음"}</span></div>
     <p class="note">키가 있으면 ① 기록에 질문해 답을 만들고 ② 짧은 녹음을 폰에서 바로 전사합니다. 키는 이 기기에만 저장되고 드라이브에 올라가지 않습니다.</p>
@@ -1713,7 +2081,7 @@ async function renderSettings() {
     <button class="btn btn-line btn-block" id="s-guide">아이폰 단축어 가이드 보기</button>
   </div>
 
-  <div class="sgroup">
+  <div class="sgroup" id="sgroup-schedule">
     <h2>예약 녹음</h2>
     <div class="srow"><span class="k">예약 녹음 모드</span>
       <button class="sw" id="s-sch-on" role="switch" aria-checked="${sch.enabled ? "true" : "false"}" aria-label="예약 녹음 모드"><i></i></button></div>
@@ -1751,7 +2119,7 @@ async function renderSettings() {
     <a class="btn btn-ghost btn-block" href="demo/flip-lab.html" target="_blank" rel="noopener">센서 테스트 열기 (녹음 없이 확인)</a>
     <p class="note">켜 두면 <b>어느 화면에 있든</b> 폰을 엎기만 하면 1.5초 뒤 녹음이 시작되고 화면은 검게 절전합니다. 다시 들면 자동 저장.<br>
     아이폰은 앱을 새로 열 때마다 센서 권한을 한 번 더 물어봅니다(브라우저 보안 규칙). 위 상태가 <b>허용됨 · 신호 정상</b>이면 준비된 것이고, <b>확인 필요</b>면 <b>센서 권한 허용</b>을 한 번 눌러 주세요.<br>
-    <b>마이크는 한 번 열면 계속 들고 있습니다</b> — 그래서 두 번째·세 번째 엎기에도 다시 세팅할 필요가 없습니다. 대기 중에는 아이폰 상단에 <b>주황색 마이크 표시</b>가 남습니다(소리를 담고 있지는 않습니다). 전화·화면 잠금으로 끊기면 이 화면에서 <b>마이크 다시 연결</b>을 누르거나 화면을 한 번 탭하면 됩니다.</p>
+    <b>마이크는 한 번 열면 계속 들고 있습니다</b> — 그래서 두 번째·세 번째 엎기에도 다시 세팅할 필요가 없습니다. 앱을 잠깐 <b>나갔다 돌아와도</b> 마이크·센서를 다시 묻지 않고 이어 씁니다(트랙이 살아 있으면 그대로, iOS가 끊었으면 조용히 다시 연결). 대기 중에는 아이폰 상단에 <b>주황색 마이크 표시</b>가 남습니다(소리를 담고 있지는 않습니다). 전화·화면 잠금으로 끊겨 상태가 바뀌면 이 화면의 <b>마이크 다시 연결</b>을 누르거나 화면을 한 번 탭하면 됩니다.</p>
   </div>
 
   <div class="sgroup">
@@ -2076,6 +2444,7 @@ function openRecorder() {
       }
       haptic(12);
       // 30분마다 끊어 저장 + 기기 선저장 (수동 녹음도 동일하게)
+      noteRecordingStart();
       beginLocalSession({ title: `새 녹음 ${fmtTime(new Date().toISOString())}`, type: localSettings().lastType || "work" });
       startSegTimer(localSettings().lastType || "work", Date.now());
       mainBtn.textContent = "정지";
@@ -2348,6 +2717,7 @@ async function startAutoRecording(day) {
   S.auto.on = true;
   S.auto.startedAt = Date.now();
   S.auto.type = getSchedule().type || "work";
+  noteRecordingStart(new Date(S.auto.startedAt).toISOString());
   beginLocalSession({ title: `예약 녹음 ${fmtTime(new Date().toISOString())}`, type: S.auto.type });
   startSegTimer(S.auto.type, S.auto.startedAt);
   haptic(12);

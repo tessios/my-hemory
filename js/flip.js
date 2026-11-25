@@ -85,6 +85,7 @@ export class FlipWatcher {
 
   get granted() { return this.perm === "granted" || this.perm === "not-required"; }
   get hasSignal() { return !!this.last.t && Date.now() - this.last.t < STALE_MS; }
+  get signalAgeMs() { return this.last.t ? Date.now() - this.last.t : Infinity; }
   get elapsedSec() { return this.active && this.startedAt ? (Date.now() - this.startedAt) / 1000 : 0; }
 
   /* 반드시 사용자 탭/클릭 핸들러에서 곧바로 호출한다.
@@ -293,14 +294,36 @@ export class FlipWatcher {
     }
   }
 
+  /* 앱으로 돌아왔을 때 — 권한은 그대로 두고 리스너만 다시 건다(절대 다시 묻지 않는다).
+     iOS 는 백그라운드에서 센서 이벤트를 쉬게 하므로, 복귀 시 리스너를 새로 걸고
+     watchdog(ListenAt)을 지금으로 옮겨 '신호 없음'으로 잘못 표시되지 않게 한다. */
+  resume() {
+    if (!this.supported) return { ok: false, reason: "unsupported" };
+    if (this.perm === "denied") return { ok: false, reason: "denied" };
+    if (!this.armed && !this.probe) return { ok: false, reason: "off" };
+    const was = this.listening;
+    if (was) this._stopListening();
+    this.start();
+    return { ok: true, restarted: was };
+  }
+
+  /* 탭에서 센서 재개 — 이미 허용된 권한이면 프롬프트 없이 'granted' 만 돌아온다.
+     (복귀 뒤 이벤트가 끝내 안 올 때 이 탭이 실제로 이벤트를 살리는 경우가 많다) */
+  async reanimate() {
+    this.resume();
+    if (this.perm === "unknown") { try { await this.requestPermission(); } catch {} }
+    this.start();
+    return this.listening;
+  }
+
   /* 사람이 읽는 현재 상태 */
   get label() {
     switch (this.state) {
       case "active": return "녹음 중";
       case "ready": return "대기 중 · 폰을 엎으면 시작";
-      case "need-tap": return "센서 권한 필요 · 한 번 탭";
+      case "need-tap": return "탭해서 센서 재개";
       case "denied": return "센서 권한 차단됨";
-      case "nosignal": return "센서 신호 없음";
+      case "nosignal": return "센서 신호 없음 · 탭해서 재개";
       case "unsupported": return "센서 미지원";
       default: return "꺼짐";
     }

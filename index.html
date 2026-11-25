@@ -7,10 +7,10 @@
 <meta name="description" content="내 드라이브에만 저장되는 개인 녹음·전사·검색 메모리">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="Hemory">
 <meta name="format-detection" content="telephone=no">
-<meta name="theme-color" content="#ffffff">
+<meta name="theme-color" content="#0a0b0c">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" sizes="180x180" href="icons/icon-180.png">
 <link rel="icon" href="icons/favicon-32.png" sizes="32x32">
@@ -36,48 +36,99 @@
 
   <!-- ── 타임라인 ────────────────────────────────── -->
   <section id="screen-timeline" class="screen">
-    <header class="head">
-      <div class="head-row">
-        <div>
-          <div class="brand">HEMORY</div>
-          <h1 class="head-title" id="tl-month">기록</h1>
-        </div>
-        <div class="head-actions">
-          <button class="text-btn" id="btn-select">선택</button>
-          <button class="icon-btn" id="btn-sync" title="동기화" aria-label="동기화">
-            <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 10a8 8 0 0 1 13.7-4.3L20 8M20 4v4h-4M20 14a8 8 0 0 1-13.7 4.3L4 16M4 20v-4h4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-          </button>
-        </div>
-      </div>
-      <div class="head-sub" id="tl-sub">불러오는 중…</div>
-    </header>
-    <div class="chips" id="tl-chips"></div>
+    <div class="topbar">
+      <button class="menu-btn" id="btn-menu" aria-label="메뉴 · 설정">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
+      </button>
+      <span class="topbar-sep" aria-hidden="true"></span>
+      <button class="listen-pill" id="btn-listen" aria-label="탭하여 듣기 시작">
+        <span class="lp-text">
+          <span class="lp-title">탭하여 듣기 시작</span>
+          <span class="lp-sub">마지막 시작 <b id="last-start">—</b></span>
+        </span>
+        <span class="lp-wave" aria-hidden="true"></span>
+      </button>
+    </div>
+
+    <div class="datenav">
+      <button class="dn-month" id="dn-month" aria-label="다른 날짜 고르기">
+        <span id="dn-month-text">2026 / 11</span>
+        <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="m9 6 6 6-6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="dn-today" id="btn-today">오늘로</button>
+    </div>
+
+    <div class="weekstrip" id="weekstrip" role="tablist" aria-label="요일별 날짜"></div>
+
     <div id="recovery" class="recovery" hidden></div>
     <div id="tl-tip"></div>
-    <div id="tl-list" class="list"></div>
+    <div id="tl-status" class="tl-status" hidden></div>
+    <div id="dayview" class="dayview"></div>
   </section>
 
-  <!-- ── 검색 ────────────────────────────────────── -->
+  <!-- ── 활동: 카테고리 · 요약 · 검색 ─────────────── -->
   <section id="screen-search" class="screen">
-    <header class="head head-search">
+    <header class="phead">
+      <h1>활동</h1>
+      <p>카테고리 · 요약 · 검색</p>
+    </header>
+    <div class="searchwrap">
       <div class="searchbar">
         <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-        <input id="q" type="text" inputmode="search" autocomplete="off" autocapitalize="off" placeholder="기억나지 않는 말을 검색" autocomplete="off" enterkeyhint="search">
+        <input id="q" type="text" inputmode="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="기억나지 않는 말을 검색" enterkeyhint="search">
         <button id="q-clear" class="q-clear" hidden aria-label="지우기">✕</button>
       </div>
       <div class="seg" id="search-mode">
         <button data-mode="search" class="on">검색</button>
         <button data-mode="ask">AI에게 묻기</button>
       </div>
-    </header>
+    </div>
     <div class="chips" id="search-chips"></div>
     <div id="search-body" class="list"></div>
+  </section>
+
+  <!-- ── 인물: 화자 ─────────────────────────────── -->
+  <section id="screen-people" class="screen">
+    <header class="phead">
+      <h1>인물</h1>
+      <p>전사에서 확인된 화자</p>
+    </header>
+    <div id="people-sum" class="people-sum"></div>
+    <div id="people-list" class="list"></div>
+  </section>
+
+  <!-- ── 에이전트: AI 질문 · 설정 ─────────────────── -->
+  <section id="screen-agent" class="screen">
+    <header class="phead">
+      <h1>에이전트</h1>
+      <p>기록에 묻고, 녹음 환경을 관리합니다</p>
+    </header>
+    <div class="agent-card">
+      <div class="agent-top">
+        <span class="agent-dot" aria-hidden="true"></span>
+        <span class="agent-title">기록 에이전트</span>
+        <span class="agent-badge" id="agent-badge">Gemini</span>
+      </div>
+      <textarea id="ask-input" rows="2" placeholder="예: 지난 회의에서 정한 일정이 뭐였지?" autocomplete="off"></textarea>
+      <button class="btn btn-primary btn-block" id="ask-run">물어보기</button>
+      <p class="agent-hint" id="agent-hint">근거가 된 문장과 함께 답합니다.</p>
+    </div>
+    <div id="ask-body" class="list"></div>
+    <div class="agent-links" id="agent-links">
+      <button class="alink" data-go="settings" data-scroll="sgroup-flip"><b>뒤집어 녹음</b><span>엎으면 시작 · 들면 저장</span></button>
+      <button class="alink" data-go="settings" data-scroll="sgroup-schedule"><b>예약 녹음</b><span>요일 · 시간 자동 녹음</span></button>
+      <button class="alink" data-go="settings" data-scroll="sgroup-ai"><b>Gemini 키</b><span>질문 · 기기 전사</span></button>
+      <button class="alink" data-go="settings" data-scroll="sgroup-account"><b>계정 · 동기화</b><span>Google 드라이브 연결</span></button>
+    </div>
   </section>
 
   <!-- ── 설정 ────────────────────────────────────── -->
   <section id="screen-settings" class="screen">
     <header class="head">
-      <div class="brand">HEMORY</div>
+      <button class="back-btn" id="btn-settings-back" aria-label="타임라인으로">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="m14 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>타임라인</span>
+      </button>
       <h1 class="head-title">설정</h1>
     </header>
     <div id="settings-body" class="settings"></div>
@@ -86,16 +137,20 @@
   <!-- ── 하단 탭 ─────────────────────────────────── -->
   <nav class="tabbar" id="tabbar" hidden>
     <button data-tab="timeline" class="active">
-      <svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 7h16M4 12h16M4 17h10" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <svg viewBox="0 0 24 24" width="22" height="22"><path d="M20 12a8 8 0 1 1-2.4-5.7" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><path d="M20 3.6V8h-4.4" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8.4V12l2.6 1.6" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
       <span>타임라인</span>
     </button>
     <button data-tab="search">
-      <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="1.7"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
-      <span>검색</span>
+      <svg viewBox="0 0 24 24" width="22" height="22"><path d="m12 3 8 4.2-8 4.2-8-4.2L12 3Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="m4 12.2 8 4.2 8-4.2M4 16.6l8 4.2 8-4.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>활동</span>
     </button>
-    <button data-tab="settings">
-      <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 3v2.2M12 18.8V21M3 12h2.2M18.8 12H21M5.6 5.6l1.6 1.6M16.8 16.8l1.6 1.6M18.4 5.6l-1.6 1.6M7.2 16.8l-1.6 1.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-      <span>설정</span>
+    <button data-tab="people">
+      <svg viewBox="0 0 24 24" width="22" height="22"><circle cx="9" cy="8.5" r="3.2" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M3.4 19.2c.5-3.1 2.8-5 5.6-5s5.1 1.9 5.6 5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M16 6.4a2.7 2.7 0 0 1 0 5.2M17.6 14.6c1.8.5 3 2 3.3 4.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <span>인물</span>
+    </button>
+    <button data-tab="agent">
+      <svg viewBox="0 0 24 24" width="22" height="22"><rect x="5" y="8" width="14" height="11" rx="3.4" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M12 4.6V8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><circle cx="12" cy="3.6" r="1.2" fill="currentColor"/><circle cx="9.4" cy="13" r="1.15" fill="currentColor"/><circle cx="14.6" cy="13" r="1.15" fill="currentColor"/><path d="M9.6 16.2h4.8" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <span>에이전트</span>
     </button>
   </nav>
 

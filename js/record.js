@@ -10,9 +10,11 @@
    (WebKit bug 215884 — "capture is not ongoing 이면 prompt 가 다시 뜬다")
    그래서 앱이 화면에 떠 있는 동안은 스트림을 닫지 않고 그대로 들고 있다가,
    녹음마다 **MediaRecorder 만 새로 만든다**. */
+import { micResumePlan, afterUnmuteWait } from "./lifecycle.js";
+
 const MIC_CONSTRAINTS = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
 
-const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set() };
+const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set(), backgrounded: false, reopening: null };
 
 /* 상태가 바뀔 때(끊김·복구·해제) 화면에 알린다 */
 export function onMicChange(fn) { mic.listeners.add(fn); return () => mic.listeners.delete(fn); }
@@ -71,11 +73,13 @@ export function acquireMic() {
   return micPending;
 }
 
-async function openMic() {
-  // 죽었거나 끊긴 트랙은 버리고 새로 연다
-  if (mic.stream) {
-    try { mic.stream.getTracks().forEach((x) => x.stop()); } catch {}
-    mic.stream = null; mic.boundTrack = null;
+async function openMic({ stopOld = true } = {}) {
+  // 죽었거나 끊긴 트랙은 버리고 새로 연다.
+  //   stopOld=false: muted(일시 인터럽트) 트랙은 stop() 하지 않는다 — 새 트랙을 받은 뒤에 정리한다.
+  const old = mic.stream;
+  if (old) { mic.stream = null; mic.boundTrack = null; }
+  if (old && stopOld) {
+    try { old.getTracks().forEach((x) => x.stop()); } catch {}
   }
   try {
     const s = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
@@ -85,6 +89,7 @@ async function openMic() {
     micNotify();
     return { ok: true, reused: false, stream: s };
   } catch (e) {
+    if (old && !stopOld && !mic.stream) { mic.stream = old; mic.boundTrack = null; bindMicTrack(old); }
     const denied = e?.name === "NotAllowedError" || e?.name === "SecurityError";
     mic.state = denied ? "denied" : "lost";
     micNotify();
@@ -92,13 +97,91 @@ async function openMic() {
   }
 }
 
+/* ── 백그라운드 전환 (v1.5) ─────────────────────────────────────
+   앱을 떠날 때 스트림을 닫지 않는다. 닫으면 iOS 가 권한을 풀어, 돌아왔을 때
+   사용자 터치 없이 다시 열 수 없고 권한 창이 다시 뜰 수 있다(WebKit bug 215884). */
+export function markBackgrounded() { mic.backgrounded = true; }
+
+export function markForegrounded() { mic.backgrounded = false; }
+
+/* 권한이 이미 'granted' 인지 확인 — 'prompt' 면 조용한 재시도 대신 제스처를 기다린다.
+   (Safari 16+) 실패하거나 미지원이면 'unknown' 으로 두고, 대여 중인 트랙 복구는 시도한다. */
+export async function micPermissionState() {
+  try {
+    const p = await navigator.permissions?.query?.({ name: "microphone" });
+    return p?.state || "unknown";
+  } catch { return "unknown"; }
+}
+
+export function unmuteWait(track, ms) {
+  return new Promise((resolve) => {
+    if (!track || track.readyState !== "live" || !track.muted) return resolve(true);
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; clearTimeout(t); try { track.removeEventListener("unmute", onUnmute); track.removeEventListener("ended", onEnded); } catch {} resolve(v); };
+    const onUnmute = () => finish(true);
+    const onEnded = () => finish(false);
+    try { track.addEventListener("unmute", onUnmute); track.addEventListener("ended", onEnded); } catch { finish(false); }
+    const t = setTimeout(() => finish(!track.muted && track.readyState === "live"), Math.max(0, ms));
+  });
+}
+
+/* 앱으로 돌아왔을 때 마이크를 이어 쓴다 — 살아 있으면 아무 것도 하지 않고,
+   iOS 가 끊었으면(muted) 잠깐 unmute 를 기다린 뒤, 그래도 안 되면 조용히 다시 연다.
+   절대 권한을 새로 묻지 않는다(권한이 'prompt' 면 gesture 상태로 돌려준다). */
+export async function resumeMicAfterBackground({ waitMs = 1200 } = {}) {
+  markForegrounded();
+  if (!mic.stream) return { ok: false, action: "none", reason: "no-lease" };
+  if (mic.reopening) return mic.reopening;
+  const permission = await micPermissionState();
+  const plan = micResumePlan(micStatus(), { permission });
+
+  if (plan.action === "none" || plan.action === "keep") {
+    if (mic.stream) bindMicTrack(mic.stream);
+    return { ok: plan.action === "keep", action: plan.action, reason: plan.reason };
+  }
+  if (plan.action === "gesture") return { ok: false, action: "gesture", reason: plan.reason };
+
+  const track = micTrack();
+  if (plan.action === "wait-unmute") {
+    const unmuted = await unmuteWait(track, waitMs);
+    const next = afterUnmuteWait(
+      { live: !!track && track.readyState === "live" && !track.muted, muted: !!track?.muted, held: !!mic.stream },
+      { permission, ended: !track || track.readyState === "ended" },
+    );
+    if (next.action === "keep") { if (mic.state !== "live") { mic.state = "live"; micNotify(); } return { ok: true, action: "keep", reason: "unmuted", waited: !unmuted }; }
+    if (next.action === "gesture") return { ok: false, action: "gesture", reason: next.reason };
+    if (next.action === "none") return { ok: false, action: "none", reason: next.reason };
+  }
+
+  // ended / 계속 muted / lost → 새로 연다(같은 권한). 새 트랙을 받은 뒤에 옛(muted) 트랙을 정리한다.
+  if (mic.reopening) return mic.reopening;
+  mic.reopening = (async () => {
+    const old = mic.stream;
+    const r = await openMic({ stopOld: false });
+    if (r.ok && old) { try { old.getTracks().forEach((x) => x.stop()); } catch {} }
+    return { ok: r.ok, action: r.ok ? "reopened" : "gesture", reason: r.reason || "ok" };
+  })().finally(() => { mic.reopening = null; });
+  return mic.reopening;
+}
+
 /* 마이크를 완전히 닫는다(뒤집어 녹음 끄기·앱을 떠날 때) */
 export function releaseMic() {
   if (mic.stream) { try { mic.stream.getTracks().forEach((x) => x.stop()); } catch {} }
   mic.stream = null;
   mic.boundTrack = null;
+  mic.reopening = null;
   mic.state = "idle";
   micNotify();
+}
+
+/* MediaRecorder 에는 대여 중인 트랙을 감싼 **별도 스트림**을 넘긴다.
+   그래야 녹음기 정리 코드가 원본(대여) 트랙을 실수로 stop 하는 일이 없다. */
+function recorderStream(stream) {
+  if (!stream) return null;
+  try {
+    if (typeof MediaStream === "function") return new MediaStream(stream.getAudioTracks());
+  } catch {}
+  return stream;
 }
 
 /* 마이크 권한 미리 받기 — 반드시 사용자 탭 핸들러에서 호출한다.
@@ -396,8 +479,8 @@ export class Recorder {
     this._silentMs = 0;
     this._noise = 0.006;
 
-    this.recStream = recStream;
-    this.rec = new MediaRecorder(recStream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
+    this.recStream = recorderStream(recStream);
+    this.rec = new MediaRecorder(this.recStream,  this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
     this.chunks = [];
     this.rec.ondataavailable = (e) => {
       if (e.data && e.data.size) {

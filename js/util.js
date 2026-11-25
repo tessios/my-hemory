@@ -53,6 +53,23 @@ export function relDay(iso) {
   return "";
 }
 
+/* "오후 2:04" */
+export function fmtTimeOfDay(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const ap = d.getHours() < 12 ? "오전" : "오후";
+  let h = d.getHours() % 12; if (!h) h = 12;
+  return `${ap} ${h}:${pad(d.getMinutes())}`;
+}
+
+/* "오늘 오후 2:04" · "어제 오전 9:12" · "11월 22일 오후 3:00" */
+export function fmtMoment(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const day = relDay(iso) || `${d.getMonth() + 1}월 ${d.getDate()}일`;
+  return `${day} ${fmtTimeOfDay(iso)}`;
+}
+
 export function toast(msg, ms = 2200) {
   const el = $("#toast");
   if (!el) return;
