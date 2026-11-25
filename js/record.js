@@ -583,8 +583,11 @@ export class Recorder {
     const prev = this.rec;
     const prevChunks = this.chunks;
     await new Promise((resolve) => {
-      prev.onstop = () => resolve();
-      try { if (prev.state !== "inactive") prev.stop(); else resolve(); } catch { resolve(); }
+      let done = false;
+      const fin = () => { if (!done) { done = true; resolve(); } };
+      prev.onstop = fin;
+      try { if (prev.state !== "inactive") prev.stop(); else fin(); } catch { fin(); }
+      setTimeout(fin, 2000);      // onstop 이 오지 않는 브라우저에서도 멈추지 않게
     });
     const type = this.mime || "audio/mp4";
     const blob = new Blob(prevChunks, { type });
@@ -617,9 +620,11 @@ export class Recorder {
     const speech = this.vad ? Math.min(this.speechSec, duration) : null;
     const rec = this.rec;
     await new Promise((resolve) => {
-      rec.onstop = () => resolve();
-      if (rec.state !== "inactive") rec.stop();
-      else resolve();
+      let done = false;
+      const fin = () => { if (!done) { done = true; resolve(); } };
+      rec.onstop = fin;
+      try { if (rec.state !== "inactive") rec.stop(); else fin(); } catch { fin(); }
+      setTimeout(fin, 1500);      // 앱이 가려진 직후 등 onstop 이 늦거나 오지 않아도 저장을 막지 않는다
     });
     const type = this.mime || "audio/mp4";
     const blob = new Blob(this.chunks, { type });
