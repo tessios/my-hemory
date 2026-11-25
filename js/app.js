@@ -12,8 +12,8 @@ import {
 } from "./pure.js";
 import { sensorResumePlan, sensorQuietLabel, SENSOR_QUIET_MS } from "./lifecycle.js";
 import {
-  $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, fmtMonth, dayKey, relDay, fmtMoment,
-  toast, haptic, debounce, uid, stamp, localSettings, saveSettings, sleep,
+  $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, dayKey, fmtMoment,
+  toast, haptic, debounce, uid, stamp, localSettings, saveSettings,
 } from "./util.js";
 
 const S = {
