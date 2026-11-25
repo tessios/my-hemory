@@ -178,7 +178,7 @@ function noteRecordingStart(at = new Date().toISOString()) {
 function paintLastStart() {
   const el = $("#last-start");
   if (!el) return;
-  const at = localSettings().lastStart;
+  const at = localSettings().lastStart || S.records?.[0]?.started_at;
   el.textContent = at ? fmtMoment(at) : "아직 없음";
 }
 
