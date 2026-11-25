@@ -80,10 +80,13 @@ export function audioMimeFor(name = "", contentType = "") {
   return "audio/mp4";
 }
 
-/* 녹음이 사실상 무음이었는지 판정 */
+/* 녹음이 사실상 무음이었는지 판정
+   maxRms 가 null 이면 '레벨을 재지 못했다'는 뜻(AudioContext 가 잠들어 있음)이라
+   무음이라고 단정하지 않는다 — 멀쩡한 녹음에 '무음' 딱지를 붙이지 않기 위해서다. */
 export function silentVerdict({ maxRms = 0, durationSec = 0, speechSec = null, vad = false } = {}) {
   const dur = Number(durationSec) || 0;
   if (dur < 1) return { silent: true, reason: "too_short" };
+  if (maxRms == null) return { silent: false, reason: "unknown" };
   const peak = Number(maxRms) || 0;
   if (vad && speechSec != null) {
     if (Number(speechSec) < Math.max(0.6, dur * 0.01)) return { silent: true, reason: "no_speech" };

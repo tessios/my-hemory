@@ -73,6 +73,11 @@ test("silentVerdict: 무음/정상 판정", () => {
   assert.equal(silentVerdict({ maxRms: 0.08, durationSec: 18 }).silent, false);
 });
 
+test("silentVerdict: 레벨을 재지 못했으면(null) 무음이라고 단정하지 않는다", () => {
+  assert.deepEqual(silentVerdict({ maxRms: null, durationSec: 40 }), { silent: false, reason: "unknown" });
+  assert.deepEqual(silentVerdict({ maxRms: null, durationSec: 40, speechSec: 0, vad: true }), { silent: false, reason: "unknown" });
+});
+
 test("recordSegmentLabel: 메타 라벨/시각", () => {
   assert.equal(recordSegmentLabel({}), "");
   assert.equal(recordSegmentLabel({ segment: { label: "14:00~14:30" } }), "14:00~14:30");

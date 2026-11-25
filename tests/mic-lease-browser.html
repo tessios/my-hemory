@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hemory v1.4.1 — 마이크 대여 브라우저 실측</title>
+<style>body{font:14px/1.5 -apple-system,system-ui,sans-serif;padding:18px;background:#111;color:#eee}pre{white-space:pre-wrap;background:#000;padding:12px;border-radius:10px}button{padding:14px 18px;font-size:15px;border-radius:12px;border:0;background:#fff;color:#111}</style>
+</head>
+<body>
+<h3>마이크 대여(keepMic) 실측</h3>
+<p>한 번 허용한 마이크를 녹음 사이에 닫지 않고, 세 번의 녹음에서 <code>getUserMedia</code> 가 한 번만 불리는지 확인합니다.</p>
+<button id="run">시작 (사용자 제스처)</button>
+<pre id="out">대기 중</pre>
+<script type="module">
+import { Recorder, acquireMic, releaseMic, micStatus, probeDuration } from "../js/record.js";
+
+const out = document.getElementById("out");
+const log = (o) => { out.textContent = typeof o === "string" ? o : JSON.stringify(o, null, 2); };
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+let gumCalls = 0;
+const orig = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+navigator.mediaDevices.getUserMedia = async (c) => { gumCalls++; return orig(c); };
+
+document.getElementById("run").addEventListener("click", async () => {
+  const result = { gumCalls: 0, rounds: [], trackAfterStop: null, sameStream: null, error: null };
+  try {
+    releaseMic();
+    gumCalls = 0;
+    const R = new Recorder();
+    const first = await acquireMic();
+    const firstTrack = first.stream.getAudioTracks()[0];
+    for (let i = 1; i <= 3; i++) {
+      await R.start({ keepMic: true });
+      await wait(700);
+      const s = await R.stop();
+      const dup = await probeDuration(s.blob);
+      result.rounds.push({
+        round: i,
+        bytes: s.blob.size,
+        mime: s.blob.type,
+        duration: Number((s.duration || 0).toFixed(2)),
+        probed: Number((dup || 0).toFixed(2)),
+        trackAfterStop: micStatus().readyState,
+        muted: micStatus().muted,
+      });
+    }
+    result.gumCalls = gumCalls;
+    result.trackAfterStop = micStatus().readyState;
+    result.sameStream = micStatus().live && navigator.mediaDevices && true;
+    result.trackSame = (await acquireMic()).stream.getAudioTracks()[0] === firstTrack;
+    result.holdLive = micStatus().live;
+  } catch (e) {
+    result.error = String(e && (e.stack || e.message || e));
+  }
+  log(result);
+  window.__RESULT = result;
+});
+</script>
+</body>
+</html>

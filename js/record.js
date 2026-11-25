@@ -3,17 +3,110 @@
      화면이 잠기거나 전화가 오면 브라우저가 마이크를 끊는 것은 그대로입니다(웹의 한계).
    · VAD: AnalyserNode 의 RMS 로 발화 구간을 판별해, 침묵 구간은 게인 0 으로 막아 소리를 담지 않습니다.
      (웹 API 로는 컨테이너 길이를 줄일 수 없으므로, 침묵은 '무음으로' 남기고 실제 말한 구간만 전사합니다) */
-/* 마이크 권한 미리 받기 — 반드시 사용자 탭 핸들러에서 호출한다.
-   iOS 는 처음 한 번 허용해야 하며, 허용 전에는 센서(엎기)로 시작한 녹음이 조용히 막힌다. */
-export async function prewarmMic() {
+/* ── 마이크 한 벌 계속 들고 있기(mic lease) ──────────────────────
+   iOS Safari / 홈 화면 앱은 **캡처가 이어지는 동안에만** 마이크 권한을 유지한다.
+   녹음이 끝날 때 트랙을 stop() 하면 곧(수십 초~1분) 권한이 풀려, 사용자 터치 없이
+   센서(엎기)로 시작하는 다음 녹음의 getUserMedia 가 NotAllowedError 로 막힌다.
+   (WebKit bug 215884 — "capture is not ongoing 이면 prompt 가 다시 뜬다")
+   그래서 앱이 화면에 떠 있는 동안은 스트림을 닫지 않고 그대로 들고 있다가,
+   녹음마다 **MediaRecorder 만 새로 만든다**. */
+const MIC_CONSTRAINTS = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
+
+const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set() };
+
+/* 상태가 바뀔 때(끊김·복구·해제) 화면에 알린다 */
+export function onMicChange(fn) { mic.listeners.add(fn); return () => mic.listeners.delete(fn); }
+
+export function micTrack() { return mic.stream?.getAudioTracks?.()[0] || null; }
+export function micHeld() { return !!mic.stream; }
+export function micStatus() {
+  const t = micTrack();
+  return {
+    state: mic.state,                        // idle | live | interrupted | lost | denied | unsupported
+    held: !!mic.stream,
+    live: !!t && t.readyState === "live" && !t.muted,
+    readyState: t ? t.readyState : "none",
+    muted: !!t?.muted,
+    label: t?.label || "",
+  };
+}
+
+function micNotify() {
+  const s = micStatus();
+  for (const fn of mic.listeners) { try { fn(s); } catch {} }
+}
+
+/* 전화·Siri·화면 잠금으로 iOS 가 오디오 세션을 끊으면 트랙에 mute/ended 가 온다 */
+function bindMicTrack(stream) {
+  const t = stream?.getAudioTracks?.()[0];
+  if (!t || mic.boundTrack === t) return;
+  mic.boundTrack = t;
+  const sync = () => {
+    const live = t.readyState === "live" && !t.muted;
+    const next = live ? "live" : t.readyState === "ended" ? "lost" : "interrupted";
+    if (next !== mic.state) { mic.state = next; micNotify(); }
+  };
   try {
-    if (!navigator.mediaDevices?.getUserMedia) return "unsupported";
-    const s = await navigator.mediaDevices.getUserMedia({ audio: true });
-    s.getTracks().forEach((t) => t.stop());
-    return "ok";
-  } catch (e) {
-    return e?.name === "NotAllowedError" || e?.name === "SecurityError" ? "denied" : "error";
+    t.addEventListener?.("mute", sync);
+    t.addEventListener?.("unmute", sync);
+    t.addEventListener?.("ended", sync);
+  } catch {}
+}
+
+/* 마이크를 연다. 이미 살아 있는 스트림이 있으면 그대로 재사용한다(재사용이 핵심).
+   동시에 두 번 불려도(첫 탭에서 센서·마이크 핸들러가 같이 도는 경우) getUserMedia 는 한 번만 나간다. */
+let micPending = null;
+export function acquireMic() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    mic.state = "unsupported"; micNotify();
+    return Promise.resolve({ ok: false, reason: "unsupported" });
   }
+  const t = micTrack();
+  if (t && t.readyState === "live" && !t.muted) {
+    if (mic.state !== "live") { mic.state = "live"; micNotify(); }
+    return Promise.resolve({ ok: true, reused: true, stream: mic.stream });
+  }
+  if (micPending) return micPending;
+  micPending = openMic().finally(() => { micPending = null; });
+  return micPending;
+}
+
+async function openMic() {
+  // 죽었거나 끊긴 트랙은 버리고 새로 연다
+  if (mic.stream) {
+    try { mic.stream.getTracks().forEach((x) => x.stop()); } catch {}
+    mic.stream = null; mic.boundTrack = null;
+  }
+  try {
+    const s = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+    mic.stream = s;
+    mic.state = "live";
+    bindMicTrack(s);
+    micNotify();
+    return { ok: true, reused: false, stream: s };
+  } catch (e) {
+    const denied = e?.name === "NotAllowedError" || e?.name === "SecurityError";
+    mic.state = denied ? "denied" : "lost";
+    micNotify();
+    return { ok: false, reason: denied ? "denied" : "error", error: e?.name || "error" };
+  }
+}
+
+/* 마이크를 완전히 닫는다(뒤집어 녹음 끄기·앱을 떠날 때) */
+export function releaseMic() {
+  if (mic.stream) { try { mic.stream.getTracks().forEach((x) => x.stop()); } catch {} }
+  mic.stream = null;
+  mic.boundTrack = null;
+  mic.state = "idle";
+  micNotify();
+}
+
+/* 마이크 권한 미리 받기 — 반드시 사용자 탭 핸들러에서 호출한다.
+   iOS 는 처음 한 번 허용해야 하며, 허용 전에는 센서(엎기)로 시작한 녹음이 조용히 막힌다.
+   v1.4.1: 연 스트림을 **닫지 않고** 대여 상태로 남긴다(닫으면 iOS 가 권한을 푼다). */
+export async function prewarmMic() {
+  const r = await acquireMic();
+  return r.ok ? "ok" : r.reason === "denied" ? "denied" : r.reason === "unsupported" ? "unsupported" : "error";
 }
 
 /* 오디오 컨텍스트를 제스처 안에서 깨워 둔다.
@@ -64,6 +157,8 @@ export class Recorder {
 
     /* v1.4: 신호 감시 · 세그먼트(30분) 교체 · 청크 적립 */
     this.recStream = null;     // MediaRecorder 에 물린 스트림(회전 시 재사용)
+    this.keepMic = true;       // 녹음이 끝나도 마이크 스트림을 닫지 않는다(v1.4.1)
+    this.ctxRunning = true;    // AudioContext 가 실제로 돌고 있는가(아니면 레벨·VAD 를 믿지 않는다)
     this.maxRms = 0;           // 이 구간에서 측정된 최대 레벨
     this.noSignalMs = 0;       // 완전 무신호가 이어진 시간
     this._sigAlerted = false;  // 무신호 경고를 이미 띄웠는가
@@ -244,8 +339,9 @@ export class Recorder {
 
   _levelTick() {
     if (this.state !== "recording") return;
+    if (!this.ctxRunning) return;               // 잠든 컨텍스트의 0 레벨로 무음 판정하지 않는다
     const rms = this._peakRms();
-    this.maxRms = Math.max(this.maxRms, rms);
+    this.maxRms = Math.max(this.maxRms ?? 0, rms);
     if (rms <= 0.0022) this.noSignalMs += 200;
     else this.noSignalMs = 0;
     if (this.noSignalMs >= 3000 && !this._sigAlerted) {
@@ -257,11 +353,18 @@ export class Recorder {
   }
 
   /* ── 녹음 ───────────────────────────────────────────────── */
-  async start({ vad = false } = {}) {
+  async start({ vad = false, keepMic = true } = {}) {
     if (!Recorder.supported) throw new Error("이 브라우저에서는 녹음을 지원하지 않습니다.");
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-    });
+    // v1.4.1: 새 스트림을 열지 않고 대여 중인 마이크를 그대로 쓴다.
+    //   (iOS 는 트랙을 닫으면 권한을 풀어, 사용자 터치 없는 다음 시작을 막는다)
+    this.keepMic = !!keepMic;
+    const got = await acquireMic();
+    if (!got.ok) {
+      const err = new Error(got.reason === "denied" ? "마이크 권한이 필요합니다" : "마이크를 열지 못했습니다");
+      err.code = got.reason || "error";
+      throw err;
+    }
+    this.stream = got.stream;
     this.mime = this._pickMime();
 
     const AC = window.AudioContext || window.webkitAudioContext;
@@ -269,6 +372,9 @@ export class Recorder {
     this._ownCtx = !shared;
     this.ctx = shared || new AC();
     try { await this.ctx.resume?.(); } catch {}
+    // 사용자 제스처 없이(엎어서) 시작하면 AudioContext 가 suspended 로 남을 수 있다.
+    //   그때 레벨 측정은 0 이 되므로 '무음'이라고 단정하지 않는다(원음은 스트림에서 그대로 담긴다).
+    this.ctxRunning = this.ctx.state === "running";
     const src = this.ctx.createMediaStreamSource(this.stream);
     this.src = src;
     this.analyser = this.ctx.createAnalyser();
@@ -282,7 +388,7 @@ export class Recorder {
     //   destination 스트림이 **무음을 출력**했고, 그게 그대로 저장됐다(18초/6.3kbps 사고).
     //   이제 VAD 는 녹음 경로에 끼지 않고 '말한 구간(speechSec)'만 세는 참고 정보다.
     //   침묵 제거는 전사 단계(whisper VAD)에서 한다.
-    this.vad = !!vad && Recorder.vadSupported;
+    this.vad = !!vad && Recorder.vadSupported && this.ctxRunning;
     const recStream = this.stream;
     this.speaking = false;
     this.speechSec = 0;
@@ -303,7 +409,7 @@ export class Recorder {
 
     this.startedAt = Date.now();
     this.elapsed = 0;
-    this.maxRms = 0;
+    this.maxRms = this.ctxRunning ? 0 : null;   // null = 레벨을 못 쟀다
     this.noSignalMs = 0;
     this._sigAlerted = false;
     this.state = "recording";
@@ -371,7 +477,9 @@ export class Recorder {
     try { if (navigator.audioSession) navigator.audioSession.type = "auto"; } catch {}
     if (this._onVis) { document.removeEventListener("visibilitychange", this._onVis); this._onVis = null; }
     this._releaseWakeLock();
-    try { this.stream?.getTracks().forEach((t) => t.stop()); } catch {}
+    // v1.4.1: 마이크 스트림은 '대여'가 들고 있다 — 여기서 닫지 않는다.
+    //   닫으면 iOS 가 마이크 권한을 풀어, 다음 엎기에서 사용자 터치 없이 열 수 없다.
+    if (!this.keepMic) releaseMic();
     try { this.src?.disconnect(); } catch {}
     try { this.gate?.disconnect(); } catch {}
     try { this.dest?.disconnect?.(); } catch {}
@@ -400,7 +508,7 @@ export class Recorder {
 
     this.chunks = [];
     this.speechSec = 0;
-    this.maxRms = 0;
+    this.maxRms = this.ctxRunning ? 0 : null;
     this.noSignalMs = 0;
     this._sigAlerted = false;
     this.elapsed = 0;
@@ -443,6 +551,7 @@ export class Recorder {
   cancel() {
     clearInterval(this._levelTimer);
     this._levelTimer = null;
+    this.ctxRunning = true;
     if (this.rec) { try { this.rec.onstop = null; this.rec.stop(); } catch {} }
     this._teardown();
     this.state = "idle";

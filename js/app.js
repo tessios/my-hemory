@@ -4,7 +4,7 @@ import { drive, AuthError } from "./drive.js";
 import { store } from "./store.js";
 import { buildIndex, search as doSearch, evidence, keywords, highlight } from "./search.js";
 import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./qa.js";
-import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio } from "./record.js";
+import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange } from "./record.js";
 import { FlipWatcher } from "./flip.js";
 import {
   previewLine, segmentRangeLabel, segmentDue, groupTranscript, silentVerdict, recordSegmentLabel, SEGMENT_SEC,
@@ -32,6 +32,7 @@ const S = {
   sel: { on: false, ids: new Set() },          // 타임라인 선택 모드
   seg: { index: 0, startAt: 0, timer: null, type: "work" },  // 30분 세그먼트
   segSession: null,                            // 로컬 적립 중인 녹음 세션 메타
+  mic: { warn: false, denied: false, nextTry: 0, armed: false, releasedOnHide: false },   // 마이크 연결 유지 감시
 };
 
 /* ── 예약 녹음(요일·시간) ─────────────────────────────── */
@@ -115,12 +116,74 @@ function setFaceDown(on, { prewarm = false } = {}) {
   saveSettings({ faceDown: !!on });
   flip.setArmed(!!on);
   if (on) {
-    if (prewarm) { prewarmMic(); unlockAudio(); }
+    if (prewarm) { prewarmMic(); unlockAudio(); ensureMicStandby(); }
   } else {
     flip.disable();
+    // 기능을 끄면 마이크도 닫는다(대기 중인 동안에는 계속 열어 두었던 것)
+    releaseMic();
+    S.mic.warn = false; S.mic.denied = false;
   }
   renderFlipChip();
   return flip.state;
+}
+
+/* ── 마이크 연결 유지(v1.4.1) ───────────────────────────────
+   한 번 허용한 마이크는 뒤집어 녹음 대기 중에 **계속 열어 둔다**. 그래야 두 번째·세 번째
+   엎기에서도 사용자 터치 없이 바로 녹음이 시작된다(iOS 는 캡처가 끊기면 권한을 푼다).
+   iOS 가 전화·화면 잠금·백그라운드로 트랙을 끊으면 조용히 다시 열어 보고, 그것도 막히면
+   '탭해서 마이크 연결'로 알리고 다음 터치에서 다시 연다. */
+async function ensureMicStandby({ gesture = false, tryAnyway = false } = {}) {
+  if (S.mode !== "live") return false;
+  if (S.recorder.state === "recording" || S.recorder.state === "paused") return true;
+  const st = micStatus();
+  if (st.live) {
+    if (S.mic.warn || S.mic.releasedOnHide) { S.mic.warn = false; S.mic.denied = false; S.mic.releasedOnHide = false; renderFlipChip(); }
+    return true;
+  }
+  // 이번 실행에서 아직 허용 전(idle)이거나 차단됨이면, 제스처 없이 iOS 에 권한 질문을 던지지 않는다.
+  //   → '탭해서 마이크 연결'로 알리고 다음 터치에서 연다.
+  //   이번 실행에서 열었던 트랙이 끊긴 것(interrupted·lost)이거나, 방금 우리가 백그라운드에서 닫은 것이면
+  //   권한은 살아 있으니 조용히 다시 잡아 본다.
+  const recoverable = st.state === "interrupted" || st.state === "lost" || !!S.mic.releasedOnHide;
+  if (!gesture && !recoverable && !tryAnyway) {
+    S.mic.denied = st.state === "denied";
+    armMicGesture();
+    renderFlipChip();
+    return false;
+  }
+  const r = await acquireMic();
+  if (r.ok) {
+    if (S.mic.warn) {
+      toast("마이크를 다시 연결했습니다 · 폰을 엎으면 바로 녹음됩니다", 2400);
+    }
+    S.mic.warn = false; S.mic.denied = false; S.mic.releasedOnHide = false;
+    renderFlipChip();
+    return true;
+  }
+  S.mic.warn = true;
+  S.mic.denied = r.reason === "denied";
+  S.mic.releasedOnHide = false;
+  if (!gesture) armMicGesture();
+  renderFlipChip();
+  return false;
+}
+
+/* 마이크가 끊긴 뒤에는 '다음 터치'에서 사용자 제스처와 함께 다시 연다 */
+function armMicGesture() {
+  if (S.mic.armed) return;
+  S.mic.armed = true;
+  let busy = false;
+  const events = ["pointerup", "touchend", "click", "keydown"];
+  const detach = () => { S.mic.armed = false; events.forEach((t) => document.removeEventListener(t, once, true)); };
+  const once = async () => {
+    if (busy) return;
+    if (S.mode !== "live" || !faceDownPref()) return detach();
+    busy = true;
+    const ok = await ensureMicStandby({ gesture: true });
+    busy = false;
+    if (ok) detach();
+  };
+  events.forEach((t) => document.addEventListener(t, once, true));
 }
 
 /* 앱을 새로 열면 iOS 센서 권한은 다시 한 번 필요하다 → 첫 터치에서 조용히 요청
@@ -138,11 +201,14 @@ function armFlipPermission() {
   };
   const once = async (e) => {
     if (busy) return;
-    if (!faceDownPref() || flip.granted) return detach();
+    if (!faceDownPref()) return detach();
     if (flip.perm === "denied") return detach();
     const t = e?.target;
-    if (t?.closest?.("#s-flip-on, #s-flip-perm, #rec-face, #s-flip-test, #flip-chip")) return;
+    if (t?.closest?.("#s-flip-on, #s-flip-perm, #rec-face, #s-flip-test, #flip-chip, #s-flip-mic-btn")) return;
     busy = true;
+    // 이 탭(제스처) 안에서 마이크도 먼저 열어 둔다 — iOS 는 제스처 밖 호출을 막는다
+    if (!micStatus().live) { try { await prewarmMic(); unlockAudio(); } catch {} }
+    if (flip.granted) { busy = false; renderFlipChip(); return detach(); }
     const r = await flip.requestPermission();
     busy = false;
     if (r.ok) {
@@ -165,12 +231,17 @@ async function startFaceRecording() {
   if (S.sheet?._rec) { try { closeSheet(); } catch {} }
   S.face.pending = false;
   try {
-    await S.recorder.start({ vad: localSettings().vad !== false });
+    // 마이크는 한 번 열어 둔 것을 그대로 쓴다(끝나도 닫지 않는다) → 다음 엎기에도 재세팅 없음
+    await S.recorder.start({ vad: localSettings().vad !== false, keepMic: true });
   } catch (e) {
     console.warn("face start", e);
     S.face.pending = true;
+    S.mic.warn = true;
+    S.mic.denied = e?.code === "denied";
     showSleepOverlay("tap");
-    toast("마이크를 열지 못했습니다 · 검은 화면을 한 번 탭해 주세요", 3200);
+    armMicGesture();
+    toast("마이크를 열지 못했습니다 · 화면을 한 번 탭해 주세요", 3200);
+    renderFlipChip();
     return false;
   }
   S.face.active = true;
@@ -379,9 +450,16 @@ function renderFlipChip() {
   el.hidden = !show;
   if (!show) return;
   el.dataset.state = flip.state;
-  const label = flip.state === "need-tap" ? "탭해서 센서 연결"
+  const m = micStatus();
+  el.dataset.mic = flip.state === "active" || m.live ? "live" : S.mic.denied || m.state === "denied" ? "denied" : "lost";
+  let label = flip.state === "need-tap" ? "탭해서 센서 연결"
     : flip.state === "nosignal" ? "센서 신호 없음 · 탭해서 다시 연결"
     : flip.label;
+  // 센서는 준비됐는데 마이크가 없다면 그 사실을 먼저 알린다(v1.4.1)
+  if (flip.state !== "active" && faceDownPref() && !m.live) {
+    label = S.mic.denied || m.state === "denied" ? "마이크 권한 차단됨 · 설정에서 허용"
+      : "탭해서 마이크 연결";
+  }
   const t = flip.state === "active" ? ` · ${fmtClock(flip.elapsedSec)}` : "";
   el.innerHTML = `<span class="fc-dot"></span><span>뒤집어 녹음 · ${esc(label)}${t}</span>`;
 }
@@ -414,6 +492,17 @@ function paintFlipReadout(force = false) {
   if (permEl) {
     permEl.textContent = flip.perm === "denied" ? "차단됨"
       : flip.granted ? (flip.hasSignal ? "허용됨 · 신호 정상" : "허용됨") : "확인 필요";
+  }
+  const micEl = $("#s-flip-mic", body);
+  if (micEl) {
+    const m = micStatus();
+    const denied = S.mic.denied || m.state === "denied";
+    micEl.dataset.mic = m.live ? "live" : denied ? "denied" : "lost";
+    micEl.textContent = m.live ? "연결됨 · 대기 중에도 열어 둠"
+      : denied ? "차단됨 · 폰 설정에서 허용"
+      : m.state === "interrupted" ? "끊김 · 다시 연결 중"
+      : m.state === "lost" ? "끊김 · 탭해서 다시 연결"
+      : "아직 열지 않음";
   }
 }
 
@@ -566,13 +655,20 @@ function bindGlobal() {
 
   /* 화면이 가려지기 전까지 모인 소리는 잃지 않게 저장 */
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "hidden") rescueRecording("hidden");
-    else {
+    if (document.visibilityState === "hidden") {
+      rescueRecording("hidden");
+      // 백그라운드에서는 어차피 녹음을 시작할 수 없다 — iOS 가 오디오 세션을 잡고 있지 않게 마이크를 닫는다
+      if (S.recorder.state === "idle" || S.recorder.state === "done") {
+        S.mic.releasedOnHide = micStatus().held;
+        releaseMic();
+      }
+    } else {
       schedTick(); renderAutoBar(); resumeConnection();
       // 앱으로 돌아오면 센서 감시를 다시 건다(백그라운드에서 브라우저가 리스너를 쉬게 한다)
       if (faceDownPref()) {
         if (!flip.granted) armFlipPermission();
         else if (!flip.listening) flip.start();
+        ensureMicStandby();          // 돌아오자마자 마이크도 조용히 다시 연결(v1.4.1)
       }
       renderFlipChip();
     }
@@ -610,16 +706,35 @@ function bindGlobal() {
       return;
     }
     if (!flip.listening) { flip.start(); renderFlipChip(); toast("센서 감시를 다시 켰습니다", 1600); return; }
+    // 마이크가 끊겨 있으면 이 탭으로 바로 다시 연다(v1.4.1)
+    if (!micStatus().live && !S.face.active) {
+      const ok = await ensureMicStandby({ gesture: true });
+      if (ok) { toast("마이크를 연결했습니다 · 폰을 엎어 보세요", 1800); return; }
+    }
     setTab("settings");
     setTimeout(() => $("#sgroup-flip")?.scrollIntoView({ block: "center", behavior: "smooth" }), 60);
   });
 
   /* 예열: 예약 녹음 20초마다 확인, 뒤집어 녹음은 첫 탭에서 센서 권한 */
   setInterval(schedTick, 20000);
+  /* 마이크 연결 유지 감시(v1.4.1) — 엎기 대기 중에 트랙이 조용해졌으면 다시 잡는다.
+     실패하면 간격을 늘려 iOS 에 권한 질문을 연속으로 던지지 않는다. */
+  onMicChange(() => { renderFlipChip(); paintFlipReadout(); });
+  setInterval(() => {
+    if (S.mode !== "live" || !faceDownPref()) return;
+    if (document.visibilityState !== "visible") return;
+    if (!recorderIdle()) return;
+    if (Date.now() < (S.mic.nextTry || 0)) return;
+    if (micStatus().live) return;
+    S.mic.nextTry = Date.now() + 8000;
+    ensureMicStandby().then((ok) => { if (!ok) S.mic.nextTry = Date.now() + 20000; });
+  }, 5000);
   if (faceDownPref()) {
     flip.setArmed(true);
     if (flip.granted) flip.start();          // 권한이 이미 있는 환경(안드로이드·데스크톱)
     else armFlipPermission();                // 아이폰: 앱을 새로 열면 한 번 더 물어야 한다
+    // 앱을 새로 열면 마이크는 이번 실행의 첫 탭에서 조용히 다시 연다(armFlipPermission 이 같이 처리)
+    if (!micStatus().live) armMicGesture();
   }
   renderFlipChip();
 }
@@ -1626,14 +1741,17 @@ async function renderSettings() {
     <div class="srow"><span class="k">뒤집어 녹음</span>
       <button class="sw" id="s-flip-on" role="switch" aria-checked="${faceDownPref() ? "true" : "false"}" aria-label="뒤집어서 자동 녹음"${flip.supported ? "" : " disabled"}><i></i></button></div>
     <div class="srow"><span class="k">센서 권한</span><span class="v" id="s-flip-perm">${flip.perm === "denied" ? "차단됨" : flip.granted ? (flip.hasSignal ? "허용됨 · 신호 정상" : "허용됨") : "확인 필요"}</span></div>
+    <div class="srow"><span class="k">마이크 연결</span><span class="v" id="s-flip-mic" data-mic="lost">${micStatus().live ? "연결됨 · 대기 중에도 열어 둠" : "아직 열지 않음"}</span></div>
     <div class="flip-test">
       <div class="flip-now" id="s-flip-now">—</div>
       <div class="flip-verdict" id="s-flip-verdict" data-pose="${flip.pose}">${flip.active ? "녹음 중입니다" : "폰을 엎으면 이 칸이 검게 바뀝니다"}</div>
     </div>
     <button class="btn btn-line btn-block" id="s-flip-perm">센서 권한 허용 · 다시 요청</button>
+    <button class="btn btn-ghost btn-block" id="s-flip-mic-btn">마이크 다시 연결</button>
     <a class="btn btn-ghost btn-block" href="demo/flip-lab.html" target="_blank" rel="noopener">센서 테스트 열기 (녹음 없이 확인)</a>
     <p class="note">켜 두면 <b>어느 화면에 있든</b> 폰을 엎기만 하면 1.5초 뒤 녹음이 시작되고 화면은 검게 절전합니다. 다시 들면 자동 저장.<br>
-    아이폰은 앱을 새로 열 때마다 센서 권한을 한 번 더 물어봅니다(브라우저 보안 규칙). 위 상태가 <b>허용됨 · 신호 정상</b>이면 준비된 것이고, <b>확인 필요</b>면 <b>센서 권한 허용</b>을 한 번 눌러 주세요. 켤 때 마이크 권한도 함께 미리 허용해 둡니다.</p>
+    아이폰은 앱을 새로 열 때마다 센서 권한을 한 번 더 물어봅니다(브라우저 보안 규칙). 위 상태가 <b>허용됨 · 신호 정상</b>이면 준비된 것이고, <b>확인 필요</b>면 <b>센서 권한 허용</b>을 한 번 눌러 주세요.<br>
+    <b>마이크는 한 번 열면 계속 들고 있습니다</b> — 그래서 두 번째·세 번째 엎기에도 다시 세팅할 필요가 없습니다. 대기 중에는 아이폰 상단에 <b>주황색 마이크 표시</b>가 남습니다(소리를 담고 있지는 않습니다). 전화·화면 잠금으로 끊기면 이 화면에서 <b>마이크 다시 연결</b>을 누르거나 화면을 한 번 탭하면 됩니다.</p>
   </div>
 
   <div class="sgroup">
@@ -1723,7 +1841,7 @@ async function renderSettings() {
     }
     const r = await flip.enable();
     const usable = r.ok || r.reason === "timeout" || r.reason === "unknown";
-    if (usable) { prewarmMic(); unlockAudio(); }
+    if (usable) { prewarmMic(); unlockAudio(); ensureMicStandby(); }
     setFaceDown(usable);
     renderSettings();
     toast(
@@ -1734,7 +1852,7 @@ async function renderSettings() {
   });
   $("#s-flip-perm")?.addEventListener("click", async () => {
     const r = await flip.requestPermission();
-    if (r.ok || r.reason === "timeout" || r.reason === "unknown") { prewarmMic(); unlockAudio(); }
+    if (r.ok || r.reason === "timeout" || r.reason === "unknown") { prewarmMic(); unlockAudio(); ensureMicStandby({ gesture: true }); }
     flip.setArmed(faceDownPref() || r.ok);
     if (r.ok && !faceDownPref()) setFaceDown(true);
     renderSettings();
@@ -1742,6 +1860,13 @@ async function renderSettings() {
       r.ok ? "센서 권한을 허용했습니다"
         : r.reason === "timeout" || r.reason === "unknown" ? "권한 창이 응답하지 않았습니다 · 한 번 더 눌러 주세요"
         : "권한이 거부되었습니다 · 아이폰 설정 → 앱 → 동작 및 방향 접근", 3600);
+  });
+  $("#s-flip-mic-btn")?.addEventListener("click", async () => {
+    const ok = await ensureMicStandby({ gesture: true });
+    renderSettings();
+    toast(ok ? "마이크를 연결했습니다 · 폰을 엎으면 바로 녹음됩니다"
+      : S.mic.denied ? "마이크 권한이 막혀 있습니다 · 아이폰 설정 → 앱 → 마이크"
+      : "마이크를 열지 못했습니다 · 잠시 뒤 다시 눌러 주세요", 3200);
   });
 
   flip.setProbe(true);          // 설정 화면에서는 녹음 없이 센서 값만 보여 준다
@@ -1945,7 +2070,7 @@ function openRecorder() {
   mainBtn.addEventListener("click", async () => {
     if (R.state === "idle") {
       try {
-        await R.start({ vad });
+        await R.start({ vad, keepMic: faceDownPref() });
       } catch (e) {
         return toast("마이크를 사용할 수 없습니다: " + (e.message || "권한 확인"));
       }
@@ -2208,7 +2333,8 @@ async function startAutoRecording(day) {
   if (!recorderIdle()) return false;
   S.auto.pending = true;
   try {
-    await S.recorder.start({ vad: localSettings().vad !== false });
+    // 뒤집어 녹음 대기 중이면 마이크를 계속 들고 있다(다음 엎기에도 바로 시작)
+    await S.recorder.start({ vad: localSettings().vad !== false, keepMic: faceDownPref() });
   } catch (e) {
     // iOS 는 사용자 조작 없이는 마이크를 열지 못할 때가 있다 → 화면을 한 번 탭하면 다시 시도
     console.warn("auto start blocked", e);
