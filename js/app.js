@@ -614,6 +614,9 @@ async function boot() {
     setTimeout(() => toast(notice, 4500), 500);
   }
 
+  // ?demo=1 — 로그인 없이(또는 로그인 상태에서도) 가상 데모로 둘러보기
+  if (new URLSearchParams(location.search).get("demo") === "1") { enterDemo(); return; }
+
   // 한 번이라도 로그인했다면 토큰이 만료돼도 첫 화면으로 돌아가지 않는다.
   if (drive.hasSession) {
     enterLive();
@@ -923,6 +926,8 @@ async function enterLive() {
 function applyDeepLink() {
   const p = new URLSearchParams(location.search);
   if (p.get("tab") === "search") setTab("search");
+  if (p.get("tab") === "people") setTab("people");
+  if (p.get("tab") === "agent") setTab("agent");
   if (p.get("action") === "record") setTimeout(openRecorder, 500);
 }
 
