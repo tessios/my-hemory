@@ -289,7 +289,7 @@ function armFlipPermission() {
   };
   const once = async (e) => {
     if (busy) return;
-    if (!faceDownPref()) return detach();
+    if (S.mode !== "live" || !faceDownPref()) return detach();
     if (flip.perm === "denied") return detach();
     const t = e?.target;
     if (t?.closest?.("#s-flip-on, #s-flip-perm, #rec-face, #s-flip-test, #flip-chip, #s-flip-mic-btn")) return;
@@ -845,7 +845,7 @@ function bindGlobal() {
     S.mic.nextTry = Date.now() + 8000;
     ensureMicStandby().then((ok) => { if (!ok) S.mic.nextTry = Date.now() + 20000; });
   }, 5000);
-  if (faceDownPref()) {
+  if (S.mode === "live" && faceDownPref()) {
     flip.setArmed(true);
     if (flip.granted) flip.start();          // 권한이 이미 있는 환경(안드로이드·데스크톱)
     else armFlipPermission();                // 아이폰: 앱을 새로 열면 한 번 더 물어야 한다
@@ -1338,7 +1338,7 @@ function renderDay() {
   const blocks = flow.blocks.map((b) => {
     const r = byId.get(b.id);
     const t = TYPES[r.type] || TYPES.etc;
-    const short = b.height < 124;
+    const short = b.height < 140;
     const picked = S.sel.ids.has(r.id);
     return `<button class="blk ${r.status === "pending" ? "pending" : ""} ${picked ? "on" : ""}" data-id="${esc(r.id)}" data-short="${short ? 1 : 0}" style="top:${b.top}px;height:${b.height}px">
       <span class="blk-range">${esc(blockRangeLabel(r.started_at, r.duration_sec))}</span>
@@ -1610,7 +1610,7 @@ function renderAgent() {
 
 /* ────────────────────────────────── 메뉴 · 날짜 고르기 ── */
 function openMenuSheet() {
-  const email = localStorage.getItem("hemory.email") || "";
+  const email = S.mode === "live" ? (localStorage.getItem("hemory.email") || "") : "";
   const dayN = recordsOnDay(S.day).length;
   const sheet = openSheet({
     title: "메뉴",

@@ -45,7 +45,7 @@ test("timelineFlow: 하루 기록을 시간 순서로, 겹치지 않게 쌓는�
   }
   // 길이에 비례(긴 블록이 더 높다) + 최소 높이 보장
   assert.ok(f.blocks[2].height > f.blocks[1].height);
-  assert.ok(f.blocks.every((b) => b.height >= 112));
+  assert.ok(f.blocks.every((b) => b.height >= 132));
   // 전체 높이는 마지막 블록 아래까지
   const last = f.blocks[f.blocks.length - 1];
   assert.ok(f.height > last.top + last.height);

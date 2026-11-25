@@ -116,12 +116,12 @@ export async function micPermissionState() {
 export function unmuteWait(track, ms) {
   return new Promise((resolve) => {
     if (!track || track.readyState !== "live" || !track.muted) return resolve(true);
-    let done = false;
-    const finish = (v) => { if (done) return; done = true; clearTimeout(t); try { track.removeEventListener("unmute", onUnmute); track.removeEventListener("ended", onEnded); } catch {} resolve(v); };
+    let done = false, t = null;
+    const finish = (v) => { if (done) return; done = true; if (t) clearTimeout(t); try { track.removeEventListener("unmute", onUnmute); track.removeEventListener("ended", onEnded); } catch {} resolve(v); };
     const onUnmute = () => finish(true);
     const onEnded = () => finish(false);
     try { track.addEventListener("unmute", onUnmute); track.addEventListener("ended", onEnded); } catch { finish(false); }
-    const t = setTimeout(() => finish(!track.muted && track.readyState === "live"), Math.max(0, ms));
+    t = setTimeout(() => finish(!track.muted && track.readyState === "live"), Math.max(0, ms));
   });
 }
 
@@ -164,7 +164,7 @@ export async function resumeMicAfterBackground({ waitMs = 1200 } = {}) {
   return mic.reopening;
 }
 
-/* 마이크를 완전히 닫는다(뒤집어 녹음 끄기·앱을 떠날 때) */
+/* 마이크를 완전히 닫는다 — 뒤집어 녹음 기능을 끌 때만. 앱을 떠날 때는 닫지 않는다(v1.5). */
 export function releaseMic() {
   if (mic.stream) { try { mic.stream.getTracks().forEach((x) => x.stop()); } catch {} }
   mic.stream = null;

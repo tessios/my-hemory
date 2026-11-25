@@ -100,7 +100,7 @@ export function silentVerdict({ maxRms = 0, durationSec = 0, speechSec = null, v
    기록을 실제 시작 시각 순서로 놓고, 길이에 비례하는 높이를 준다.
    기록 사이의 빈 시간은 압축해(시간 눈금은 그 안에 비례 배치) 하루가 한 화면 흐름에 담기게 한다.
    반환: { height, blocks:[{id,top,height,startMin,endMin}], gaps:[{top,height,minutes}], ticks:[{min,top}] } */
-export const FLOW = { minHeight: 112, pxPerMin: 1.5, gapMin: 8, gapPx: 18, gapMax: 96, lead: 26, tail: 34 };
+export const FLOW = { minHeight: 132, pxPerMin: 1.5, gapMin: 8, gapPx: 18, gapMax: 96, lead: 26, tail: 34 };
 
 export function minutesOf(iso) {
   const d = new Date(iso);
