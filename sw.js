@@ -1,7 +1,12 @@
 /* Hemory 개인용 서비스 워커 — 앱 껍데기만 캐시. 드라이브/제미나이 응답은 절대 캐시하지 않는다.
-   v1.5.0: 다크 타임라인 UI(4탭) + 백그라운드 복귀 시 마이크·센서 재요청 제거(js/lifecycle.js 추가). v1.4.1: 뒤집어 녹음 마이크 연결 유지(스트림 재사용·keepMic) — 엎을 때마다 재세팅하지 않는다. v1.4.0: 30분 세그먼트·선택 삭제·Blob 재생·무음 감지(js/pure.js 추가). v1.3.3: 뒤집어 녹음 감지(js/flip.js) 분리. v1.3.2: 네트워크 우선으로 바꿔 새 버전이 다음 실행에 바로 반영되게 했다.
-           (예전에는 캐시 먼저라서 예전 화면·예전 코드가 계속 열렸다) */
-const VERSION = "hemory-v1.5.0";
+   v1.5.1: 버전·캐시 키를 올리고, 설치 즉시 활성화(skipWaiting) + version.json 은 캐시 금지.
+           아이폰 홈화면 앱에 구버전 화면·구버전 코드가 남지 않게 하는 것이 목적이다.
+           (앱 js/app.js 도 version.json 과 대조해 다르면 캐시를 지우고 새로 연다)
+   v1.5.0: 다크 타임라인 UI(4탭) + 백그라운드 복귀 시 마이크·센서 재요청 제거(js/lifecycle.js 추가).
+   v1.4.1: 뒤집어 녹음 마이크 연결 유지(스트림 재사용·keepMic) — 엎을 때마다 재세팅하지 않는다.
+   v1.4.0: 30분 세그먼트·선택 삭제·Blob 재생·무음 감지(js/pure.js 추가).
+   v1.3.2: 네트워크 우선으로 바꿔 새 버전이 다음 실행에 바로 반영되게 했다. */
+const VERSION = "hemory-v1.5.1";
 const SHELL = [
   "./",
   "./index.html",
@@ -16,6 +21,7 @@ const SHELL = [
   "./js/record.js",
   "./js/flip.js",
   "./js/lifecycle.js",
+  "./js/flow.js",
   "./js/pure.js",
   "./js/util.js",
   "./icons/icon-180.png",
@@ -29,6 +35,8 @@ self.addEventListener("message", (e) => {
 });
 
 self.addEventListener("install", (e) => {
+  // 새 워커를 곧바로 대기열에서 꺼내 활성화한다(구버전이 계속 잡고 있지 않게)
+  self.skipWaiting();
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).catch(() => {}));
 });
 
@@ -50,6 +58,12 @@ self.addEventListener("fetch", (e) => {
       url.hostname.includes("generativelanguage.googleapis.com")) return;
 
   if (url.origin !== location.origin) return;
+
+  // 버전 확인 파일은 항상 네트워크에서 새로 받는다(캐시에 남으면 업데이트 판정이 틀어진다)
+  if (url.pathname.endsWith("/version.json")) {
+    e.respondWith(fetch(req, { cache: "no-store" }).catch(() => new Response("{}", { headers: { "Content-Type": "application/json" } })));
+    return;
+  }
 
   const isDoc = req.mode === "navigate" || url.pathname.endsWith("/") || !url.pathname.split("/").pop().includes(".");
   const networkFirst = isDoc || NETWORK_FIRST.test(url.pathname);

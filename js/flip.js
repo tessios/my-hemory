@@ -89,13 +89,18 @@ export class FlipWatcher {
   get elapsedSec() { return this.active && this.startedAt ? (Date.now() - this.startedAt) / 1000 : 0; }
 
   /* 반드시 사용자 탭/클릭 핸들러에서 곧바로 호출한다.
-     (await 로 다른 일을 먼저 하면 iOS 가 '제스처 없음'으로 거부한다) */
-  async requestPermission() {
+     (await 로 다른 일을 먼저 하면 iOS 가 '제스처 없음'으로 거부한다)
+
+     silent: 제스처 없이 조용히 시도(v1.5.1). 이미 허용된 사이트면 iOS 가 프롬프트 없이
+     'granted' 를 돌려주므로, 앱을 열자마자 센서를 되살릴 수 있다. 반대로 이번에 처음
+     묻는 상황이면 WebKit 이 거부/무응답으로 끝나는데, 그 결과를 '차단됨'으로 적으면
+     사용자가 한 번도 거부하지 않았는데도 영영 차단 상태가 된다 → 상태를 바꾸지 않는다. */
+  async requestPermission({ silent = false } = {}) {
     if (!this.supported) { this.perm = "unsupported"; this._sync(); return { ok: false, reason: "unsupported" }; }
     if (!this._needsPrompt()) { this.perm = "not-required"; this._sync(); return { ok: true }; }
     if (this.perm === "granted") { this._sync(); return { ok: true }; }
 
-    this.askedThisLoad = true;
+    if (!silent) this.askedThisLoad = true;
     const ask = async (Ctor) => {
       try {
         const p = Ctor.requestPermission();
@@ -103,7 +108,7 @@ export class FlipWatcher {
         // 권한 창이 응답하지 않는 브라우저도 있어서 기다림에 한도를 둔다
         return await Promise.race([
           p.then((v) => (typeof v === "string" ? v : "error")).catch((e) => "error:" + (e?.name || "error")),
-          new Promise((r) => setTimeout(() => r("timeout"), 8000)),
+          new Promise((r) => setTimeout(() => r("timeout"), silent ? 2500 : 8000)),
         ]);
       } catch (e) { return "error:" + (e?.name || "error"); }
     };
@@ -114,6 +119,14 @@ export class FlipWatcher {
     const vals = Object.values(detail);
     const granted = vals.includes("granted");
     const denied = vals.includes("denied") || vals.some((v) => String(v).startsWith("error:NotAllowed"));
+
+    if (silent) {
+      if (granted) { this.perm = "granted"; this.start(); }
+      // 조용한 시도가 실패해도 상태를 '차단됨'으로 낮추지 않는다(제스처 안에서 다시 묻는다)
+      this._sync();
+      return { ok: granted, reason: granted ? "granted" : "silent-unknown", detail, silent: true };
+    }
+
     this.perm = granted ? "granted" : denied ? "denied" : "unknown";
     // 응답이 없어도 감시는 켠다 — 이벤트가 들어오면 아래 _absorb* 에서 허용됨으로 올린다
     if (!denied) this.start();
@@ -123,6 +136,16 @@ export class FlipWatcher {
       reason: granted ? "granted" : denied ? "denied" : vals.includes("timeout") ? "timeout" : "unknown",
       detail,
     };
+  }
+
+  /* 감시가 켜져 있어야 하는 조건(설정 켜짐)인데 꺼져 있으면 다시 건다.
+     앱 시작·탭 이동·복귀마다 호출해 '조용히 꺼진' 상태를 만들지 않는다. */
+  ensure() {
+    if (!this.supported) return false;
+    if (this.perm === "denied") return false;
+    if (!this.armed && !this.probe) return false;
+    if (!this.listening) this.start();
+    return this.listening;
   }
 
   /* 스위치를 켤 때: 권한 → 감시 시작. (마이크 예열은 호출한 쪽에서) */

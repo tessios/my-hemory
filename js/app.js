@@ -4,8 +4,9 @@ import { drive, AuthError } from "./drive.js";
 import { store } from "./store.js";
 import { buildIndex, search as doSearch, evidence, keywords, highlight } from "./search.js";
 import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./qa.js";
-import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground } from "./record.js";
+import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground, micPermissionState, leaseReady } from "./record.js";
 import { FlipWatcher } from "./flip.js";
+import { flipBootPlan, resumePlan, RESUME_GAP_MS } from "./flow.js";
 import {
   previewLine, segmentRangeLabel, segmentDue, groupTranscript, silentVerdict, recordSegmentLabel, SEGMENT_SEC,
   timelineFlow, weekDays, dateKeyOf, blockRangeLabel, CATEGORY_WORD, minutesOf, hhmm,
@@ -37,6 +38,10 @@ const S = {
   segSession: null,                            // 로컬 적립 중인 녹음 세션 메타
   mic: { warn: false, denied: false, nextTry: 0, armed: false, resumeAt: 0 },   // 마이크 연결 유지 감시
   week: [],                                    // 현재 주간 바
+  resume: { armed: false, kind: "", type: "work", at: 0 },   // 앱을 나갔다 돌아와 이어서 녹음할 대기
+  res: { on: false, type: "work", startedAt: 0, title: "" },  // 이어서 녹음(세션 연결) 중
+  recSheet: null,                              // 열려 있는 녹음 시트
+  recStop: null,                               // 그 시트의 정지·저장 핸들러
 };
 
 /* ── 예약 녹음(요일·시간) ─────────────────────────────── */
@@ -121,6 +126,7 @@ function setFaceDown(on, { prewarm = false } = {}) {
   flip.setArmed(!!on);
   if (on) {
     if (prewarm) { prewarmMic(); unlockAudio(); ensureMicStandby(); }
+    flip.ensure();                 // 감시가 꺼져 있었으면 다시 건다(v1.5.1)
   } else {
     flip.disable();
     // 기능을 끄면 마이크도 닫는다(대기 중인 동안에는 계속 열어 두었던 것)
@@ -129,6 +135,32 @@ function setFaceDown(on, { prewarm = false } = {}) {
   }
   renderFlipChip();
   return flip.state;
+}
+
+/* 앱을 열었을 때·로그인했을 때 저장된 설정으로 뒤집어 녹음을 되살린다(v1.5.1).
+   v1.5.0 은 이 복원을 bindGlobal() 끝의 `if (S.mode === "live")` 블록에 두었는데,
+   그 시점 S.mode 는 아직 null 이라 한 번도 실행되지 않았다. 그래서 설정에서 스위치를
+   켜 둔 사용자도 앱을 새로 열면 armed=false 가 되고, setTab() 의 setProbe(false) 가
+   센서 리스너를 꺼 버려 타임라인에서 엎어도 아무 일도 일어나지 않았다. */
+function restoreFaceDown() {
+  if (S.mode !== "live") return;
+  const plan = flipBootPlan({
+    pref: faceDownPref(), supported: flip.supported,
+    granted: flip.granted, perm: flip.perm, micLive: micStatus().live,
+  });
+  flip.setArmed(plan.arm);
+  if (plan.listen) flip.start();
+  else if (plan.ask === "silent") {
+    // 이미 허용된 사이트면 프롬프트 없이 granted → 앱을 열자마자 엎기 동작
+    flip.requestPermission({ silent: true }).then((r) => {
+      if (r.ok) { flip.start(); renderFlipChip(); }
+      else if (!flip.granted) armFlipPermission();   // 아니면 첫 탭에서 한 번만
+    }).catch(() => armFlipPermission());
+  } else if (plan.ask === "none" && plan.arm && !flip.granted && flip.perm !== "denied") {
+    armFlipPermission();
+  }
+  if (plan.warmMic) armMicGesture();              // 첫 탭에서 마이크도 함께 연다
+  renderFlipChip();
 }
 
 /* ── 마이크 연결 유지(v1.4.1) ───────────────────────────────
@@ -188,14 +220,45 @@ function paintLastStart() {
    · 센서: 권한은 페이지 단위라 그대로다 — 리스너만 다시 건다.
    · 녹음 중이었다면: 살아 있으면 계속, 끊겼으면 담긴 데까지 저장한다. */
 let _resumeBusy = false;
+/* 떠날 때 시작한 '저장 마무리'가 끝날 때까지 잠깐 기다린다.
+   복귀가 저장보다 먼저 돌면 recorder 가 아직 recording 이라 이어서 녹음 판단이 틀어진다. */
+async function waitForRescue(ms = 4000) {
+  const t0 = Date.now();
+  while (_rescueBusy && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 100));
+}
+
 async function resumeAfterBackground() {
   if (S.mode !== "live" || _resumeBusy) return;
   _resumeBusy = true;
   try {
+    await waitForRescue();
     if (S.recorder.state === "recording" || S.recorder.state === "paused") {
       await resumeRecordingAfterBackground();
       renderFlipChip();
       return;
+    }
+
+    /* 떠날 때 녹음 중이었다면 이어서 녹음(v1.5.1) */
+    if (S.resume.armed) {
+      const st = micStatus();
+      const perm = await micPermissionState();
+      const rp = resumePlan({
+        armed: true, gapMs: Date.now() - (S.resume.at || 0),
+        micLive: st.live, micMuted: st.muted, perm,
+        visible: document.visibilityState === "visible", busy: !recorderIdle(),
+      });
+      if (rp.action === "expire") {
+        S.resume.armed = false;
+        toast("앱을 나갔던 시간이 길어 이어서 녹음은 마쳤습니다", 2600);
+      } else if (rp.action === "auto") {
+        await resumeMicAfterBackground();           // 살아 있으면 그대로, 끊겼으면 조용히 다시 연다
+        const ok = await startResumedRecording({ type: S.resume.type || "work" });
+        if (!ok) armResumeGesture();
+        renderFlipChip();
+        return;
+      } else if (rp.action === "gesture") {
+        armResumeGesture();                          // 한 번 탭하면 이어서 시작
+      }
     }
 
     if (faceDownPref() && (flip.armed || flip.probe)) {
@@ -318,6 +381,7 @@ async function startFaceRecording() {
   // 녹음 시트가 열려 있어도(대기 상태면) 닫고 시작 — 엎는 순간이 우선이다
   if (S.sheet?._rec) { try { closeSheet(); } catch {} }
   S.face.pending = false;
+  S.resume.armed = false;            // 엎어서 시작하면 '이어서 녹음' 대기는 끝난다
   try {
     // 마이크는 한 번 열어 둔 것을 그대로 쓴다(끝나도 닫지 않는다) → 다음 엎기에도 재세팅 없음
     await S.recorder.start({ vad: localSettings().vad !== false, keepMic: true });
@@ -352,6 +416,54 @@ function recorderIdle() {
   const R = S.recorder;
   if (R.state === "done") { try { R.cancel(); } catch {} }
   return R.state === "idle";
+}
+
+/* ── 한 번 탭해서 바로 녹음(v1.5.1) ────────────────────────────
+   상단 '탭하여 듣기 시작'·FAB 를 누르면 시트만 열리던 것을, 누른 그 제스처 안에서
+   마이크·오디오·(켜 두었다면) 센서 권한까지 확보하고 **곧바로 녹음을 시작**한다. */
+function recordingNow() {
+  const st = S.recorder.state;
+  return st === "recording" || st === "paused";
+}
+
+function startQuickRecording() {
+  if (S.auto.on || S.res.on || S.face.active) return toast("녹음 중입니다 · 먼저 종료해 주세요");
+  if (!Recorder.supported) return toast("이 브라우저에서는 녹음을 지원하지 않습니다");
+  if (S.recSheet) { try { S.recStop?.(); } catch {} return; }   // 이미 열린 시트면 정지
+  unlockAudio();                       // 제스처 안에서 AudioContext 를 깨운다
+  try { prewarmMic(); } catch {}       // 제스처 안에서 getUserMedia 시작(권한 창도 여기서)
+  if (faceDownPref() && !flip.granted && flip.perm !== "denied") {
+    // 이 탭이 센서 권한도 함께 받아 둔다 → 다음부터는 엎기만 하면 된다
+    flip.requestPermission({ silent: true }).then((r) => { if (r.ok) flip.start(); }).catch(() => {});
+  }
+  openRecorder({ autoStart: true });
+}
+
+function stopQuickRecording() {
+  if (S.recSheet && S.recStop) { S.recStop(); return true; }
+  if (S.face.active || S.face.pending) { stopFaceRecording(true); return true; }
+  if (S.auto.on) { stopAutoRecording({ reason: "manual" }); return true; }
+  if (S.res.on) { stopResumedRecording({ reason: "manual" }); return true; }
+  return false;
+}
+
+/* 상단 바의 상태 — 녹음 중이면 시간이 흐르고, 누르면 정지라고 알린다 */
+function paintPill() {
+  const pill = $("#btn-listen");
+  if (!pill) return;
+  const title = $(".lp-title", pill);
+  const sub = $(".lp-sub", pill);
+  const on = recordingNow() || S.face.active || S.res.on || S.auto.on;
+  pill.classList.toggle("on", !!on);
+  if (title) {
+    title.textContent = on
+      ? `녹음 중 ${fmtClock(S.recorder.elapsedSec())} · 탭하여 정지`
+      : "탭하여 듣기 시작";
+  }
+  if (sub) sub.hidden = !!on;
+  pill.setAttribute("aria-label", on ? "녹음 정지" : "탭하여 듣기 시작");
+  // 녹음 중이라 미뤄 둔 앱 업데이트는 녹음이 끝난 이 순간 적용한다
+  if (!on && S.pendingReload) maybeApplyPendingUpdate();
 }
 
 /* ── 재생용 오디오 캐시 (같은 파일을 두 번 받지 않게) ── */
@@ -470,6 +582,7 @@ async function stopFaceRecording(save = true) {
   if (!was) return;
   S.face.active = false;
   S.face.pending = false;
+  S.resume.armed = false;            // 사용자가 직접 멈췄다 → '이어서 녹음' 대기 없음
   clearInterval(S.face.timer);
   S.face.timer = null;
   hideSleepOverlay();
@@ -499,6 +612,99 @@ async function stopFaceRecording(save = true) {
     // 기기(IndexedDB)에는 이미 남아 있다 — 다음 실행에서 복구할 수 있다
     toast("기기에 보관했습니다 · 연결되면 올라갑니다");
   }
+}
+
+/* ── 앱을 나갔다 돌아와 이어서 녹음(v1.5.1) ──────────────────────
+   iOS 는 앱을 전환하면 오디오 캡처를 멈추기 때문에, 떠날 때 그때까지를 저장하는 것은 맞다.
+   문제는 돌아와도 다시 시작하지 않아 녹음이 끊긴 채로 끝나던 것.
+   이제 떠날 때 '이어서 녹음' 의사를 기억해 두고, 돌아오면
+     · 대여한 마이크 트랙이 살아 있으면 사용자 터치 없이 바로(new MediaRecorder),
+     · 권한은 있는데 트랙이 끝났으면 조용히 다시 열어서,
+     · 그래도 막히면 한 번 탭으로 이어서 시작한다. */
+function renderResBar() {
+  const bar = $("#resume-bar");
+  if (!bar) return;
+  if (!S.res.on) { bar.hidden = true; bar.innerHTML = ""; bar.classList.remove("show"); return; }
+  const el = (Date.now() - S.res.startedAt) / 1000;
+  bar.hidden = false;
+  bar.classList.add("show");
+  bar.innerHTML = `<span class="ab-dot"></span>
+    <div class="ab-main"><b>이어서 녹음 중</b>
+      <span>${fmtClock(el)} · 앱을 다녀온 뒤에도 계속 담고 있습니다</span></div>
+    <button class="ab-stop" id="res-stop">저장</button>`;
+  $("#res-stop", bar).addEventListener("click", () => stopResumedRecording({ reason: "manual" }));
+}
+
+async function startResumedRecording({ type = "work" } = {}) {
+  if (S.mode !== "live" || S.res.on || !recorderIdle()) return false;
+  try {
+    await S.recorder.start({ vad: localSettings().vad !== false, keepMic: true });
+  } catch (e) {
+    console.warn("resume start", e);
+    S.resume.armed = true;            // 탭 한 번으로 이어서 시작
+    armResumeGesture();
+    toast("이어서 녹음하려면 화면을 한 번 탭해 주세요", 3200);
+    return false;
+  }
+  S.resume.armed = false;
+  S.res.on = true;
+  S.res.type = TYPES[type] ? type : "work";
+  S.res.startedAt = Date.now();
+  noteRecordingStart(new Date(S.res.startedAt).toISOString());
+  beginLocalSession({ title: `이어서 녹음 ${fmtTime(new Date().toISOString())}`, type: S.res.type });
+  startSegTimer(S.res.type, S.res.startedAt);
+  haptic(12);
+  clearInterval(S.res.timer);
+  S.res.timer = setInterval(renderResBar, 1000);
+  renderResBar();
+  toast("이어서 녹음 중입니다", 2000);
+  return true;
+}
+
+async function stopResumedRecording({ reason = "end" } = {}) {
+  if (!S.res.on) return;
+  clearInterval(S.res.timer);
+  S.res.timer = null;
+  stopSegTimer();
+  const segIndex = S.seg.index;
+  const segStart = S.seg.startAt || S.res.startedAt;
+  const out = await S.recorder.stop();
+  S.res.on = false;
+  S.resume.armed = false;
+  renderResBar();
+  if (!out || !out.blob?.size) { endLocalSession(); return; }
+  const endAt = Date.now();
+  const label = segmentRangeLabel(segStart, endAt);
+  try {
+    await saveRecordedOut(out, {
+      title: segIndex === 0 ? `이어서 녹음 ${fmtTime(new Date(segStart).toISOString())}` : `${label} 녹음`,
+      type: S.res.type || "work",
+      startedAt: new Date(segStart).toISOString(),
+      segment: { index: segIndex, start: new Date(segStart).toISOString(), end: new Date(endAt).toISOString(), label },
+    });
+    endLocalSession();
+    haptic([10, 40, 10]);
+    toast(reason === "end" ? "이어서 담은 녹음을 저장했습니다" : "녹음을 저장했습니다");
+  } catch {
+    toast("기기에 보관했습니다 · 연결되면 올라갑니다");
+  }
+}
+
+/* 한 번 탭으로 이어서 녹음 — 마이크가 막혔을 때의 정상 경로다 */
+function armResumeGesture() {
+  if (S.resArm) return;
+  S.resArm = true;
+  const events = ["pointerup", "touchend", "click", "keydown"];
+  const detach = () => { S.resArm = false; events.forEach((t) => document.removeEventListener(t, once, true)); };
+  const once = async () => {
+    if (!S.resume.armed) return detach();
+    if (S.mode !== "live") return detach();
+    const ok = await ensureMicStandby({ gesture: true });
+    if (!ok) return;
+    detach();
+    await startResumedRecording({ type: S.resume.type || "work" });
+  };
+  events.forEach((t) => document.addEventListener(t, once, true));
 }
 
 function showSleepOverlay(mode) {
@@ -632,7 +838,7 @@ async function boot() {
 /* 녹음 중이거나 시트가 열려 있으면 Google로 화면을 넘기지 않는다 */
 function canLeaveApp() {
   if (S.recorder.state !== "idle") return false;
-  if (S.face.active || S.auto.on) return false;
+  if (S.face.active || S.auto.on || S.res.on) return false;
   if (S.sheet?._rec) return false;
   if ($("#sheet-root").querySelector(".sheet")) return false;
   if (document.visibilityState !== "visible") return false;
@@ -675,6 +881,71 @@ async function reconnect() {
   }
 }
 
+/* ── 앱 버전 확인(v1.5.1) ────────────────────────────────────
+   아이폰 홈화면 앱은 서비스워커·HTTP 캐시 때문에 구버전 화면이 남기 쉽다.
+   서버의 version.json 과 지금 실행 중인 버전을 직접 대조하고, 다르면
+   캐시·서비스워커를 모두 지우고 새 주소로 한 번만 새로 연다. */
+let _lastUpdateCheck = 0;
+async function checkForUpdate({ force = false, minGapMs = 10 * 60 * 1000 } = {}) {
+  if (!force && Date.now() - _lastUpdateCheck < minGapMs) return { updated: false, skipped: true };
+  _lastUpdateCheck = Date.now();
+  try {
+    const res = await fetch(`version.json?ts=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error("no version.json");
+    const j = await res.json();
+    const latest = String(j.version || "").trim();
+    if (!latest || latest === CONFIG.version) return { updated: false, latest: latest || CONFIG.version };
+    // 녹음 중에 새로고침하면 담고 있던 소리가 끊긴다 → 끝난 뒤에 바꿔 끼운다
+    if (recordingNow() || S.face.active || S.auto.on || S.res.on || S.resume.armed) {
+      S.pendingReload = latest;
+      if (force) toast("새 버전이 있습니다 · 녹음이 끝나면 자동으로 업데이트합니다", 3200);
+      return { updated: false, latest, pending: true };
+    }
+    toast(`새 버전 v${latest} 로 업데이트합니다`, 2200);
+    await hardReloadVersion(latest);
+    return { updated: true, latest };
+  } catch {
+    return { updated: false, error: true };
+  }
+}
+
+/* 녹음이 끝난 뒤 미뤄 둔 업데이트 적용 */
+function maybeApplyPendingUpdate() {
+  const v = S.pendingReload;
+  if (!v) return;
+  if (recordingNow() || S.face.active || S.auto.on || S.res.on || S.resume.armed) return;
+  S.pendingReload = null;
+  toast("새 버전으로 업데이트합니다", 1800);
+  setTimeout(() => { if (v === "sw") location.reload(); else hardReloadVersion(v); }, 900);
+}
+
+async function hardReloadVersion(latest) {
+  // 같은 버전으로 두 번 새로고침하지 않는다(무한 반복 방지)
+  try {
+    if (sessionStorage.getItem("hemory.reloadedFor") === latest) {
+      toast("업데이트가 적용되지 않았습니다 · 앱을 완전히 닫았다 열어 주세요", 4200);
+      return;
+    }
+    sessionStorage.setItem("hemory.reloadedFor", latest);
+  } catch {}
+  try {
+    const regs = (await navigator.serviceWorker?.getRegistrations?.()) || [];
+    await Promise.all(regs.map((r) => r.unregister().catch(() => {})));
+  } catch {}
+  try {
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k).catch(() => {})));
+    }
+  } catch {}
+  try {
+    const url = new URL(location.href);
+    url.searchParams.set("v", latest);
+    url.searchParams.set("u", String(Date.now()));
+    location.replace(url.toString());
+  } catch { location.reload(); }
+}
+
 function bindGlobal() {
   drive.canNavigate = canLeaveApp;
   wireRecorder();
@@ -698,11 +969,18 @@ function bindGlobal() {
 
   $$("#tabbar button").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
   $("#btn-menu")?.addEventListener("click", openMenuSheet);
-  $("#btn-listen")?.addEventListener("click", () => { unlockAudio(); openRecorder(); });
+  $("#btn-listen")?.addEventListener("click", () => {
+    // 탭하면 곧바로 녹음 시작(이미 녹음 중이면 정지·저장)
+    if (recordingNow() || S.face.active || S.auto.on || S.res.on) { stopQuickRecording(); return; }
+    startQuickRecording();
+  });
   $("#btn-today")?.addEventListener("click", gotoToday);
   $("#dn-month")?.addEventListener("click", openDayPicker);
   $("#btn-settings-back")?.addEventListener("click", () => setTab("timeline"));
-  $("#fab").addEventListener("click", openRecorder);
+  $("#fab").addEventListener("click", () => {
+    if (recordingNow() || S.face.active || S.auto.on || S.res.on) { stopQuickRecording(); return; }
+    startQuickRecording();
+  });
 
   // 에이전트 탭
   $("#ask-run")?.addEventListener("click", async () => {
@@ -737,7 +1015,8 @@ function bindGlobal() {
   if ("serviceWorker" in navigator) {
     let swReloaded = false;
     const hadController = !!navigator.serviceWorker.controller;
-    navigator.serviceWorker.register("sw.js").then((reg) => {
+    navigator.serviceWorker.register("sw.js", { updateViaCache: "none" }).then((reg) => {
+      S.swReg = reg;
       reg.addEventListener?.("updatefound", () => {
         const w = reg.installing;
         if (!w) return;
@@ -748,12 +1027,21 @@ function bindGlobal() {
           }
         });
       });
+      reg.update?.().catch(() => {});
+      // 주기적으로 새 버전 확인 — 홈화면 앱은 다시 열어도 확인이 늦다
+      setInterval(() => {
+        if (document.visibilityState !== "visible") return;
+        reg.update?.().catch(() => {});
+        checkForUpdate().catch(() => {});
+      }, 30 * 60 * 1000);
+      setTimeout(() => checkForUpdate().catch(() => {}), 3000);
     }).catch(() => {});
     navigator.serviceWorker.addEventListener("controllerchange", () => {
       if (swReloaded || !hadController) return;
       swReloaded = true;
-      // 녹음 중·시트 열림이면 건드리지 않는다 (다음 실행에 반영)
+      // 녹음 중·시트 열림이면 건드리지 않는다 (녹음이 끝난 뒤 반영)
       if (canLeaveApp()) location.reload();
+      else S.pendingReload = S.pendingReload || "sw";
     });
   }
 
@@ -761,6 +1049,8 @@ function bindGlobal() {
   S.recorder.onStatus = recStatus;
   addRecListener(renderAutoBar);
   addRecListener(updateSleepOverlay);
+  addRecListener(paintPill);
+  setInterval(paintPill, 1000);      // 상단 바의 녹음 시간
 
   /* ── 앱을 떠났다 돌아오기 (v1.5) ───────────────────────────
      떠날 때: 녹음 중이면 지금까지를 저장한다(iOS 는 백그라운드에서 캡처를 멈춘다).
@@ -774,6 +1064,9 @@ function bindGlobal() {
       schedTick(); renderAutoBar(); resumeConnection();
       resumeAfterBackground();
       renderFlipChip();
+      paintPill();
+      S.swReg?.update?.().catch(() => {});
+      checkForUpdate().catch(() => {});     // 새 버전이면 캐시를 지우고 새로 연다
     }
   });
   window.addEventListener("pagehide", () => { rescueRecording("pagehide"); markBackgrounded(); });
@@ -845,13 +1138,9 @@ function bindGlobal() {
     S.mic.nextTry = Date.now() + 8000;
     ensureMicStandby().then((ok) => { if (!ok) S.mic.nextTry = Date.now() + 20000; });
   }, 5000);
-  if (S.mode === "live" && faceDownPref()) {
-    flip.setArmed(true);
-    if (flip.granted) flip.start();          // 권한이 이미 있는 환경(안드로이드·데스크톱)
-    else armFlipPermission();                // 아이폰: 앱을 새로 열면 한 번 더 물어야 한다
-    // 앱을 새로 열면 마이크는 이번 실행의 첫 탭에서 조용히 다시 연다(armFlipPermission 이 같이 처리)
-    if (!micStatus().live) armMicGesture();
-  }
+  /* 뒤집어 녹음 복원 — 로그인 전(boot)에는 아무 것도 하지 않고, enterLive() 에서 한 번 더 부른다.
+     (v1.5.0 은 여기서 S.mode === "live" 를 확인했는데 이 시점에는 항상 null 이었다) */
+  restoreFaceDown();
   renderFlipChip();
 }
 
@@ -883,7 +1172,11 @@ function setTab(tab) {
   if (tab === "people") renderPeople();
   if (tab === "agent") { renderAgent(); setTimeout(() => $("#ask-input")?.focus(), 120); }
   if (tab === "settings") renderSettings();
-  else if (typeof flip !== "undefined") flip.setProbe(false);
+  else if (typeof flip !== "undefined") {
+    flip.setProbe(false);
+    // 설정을 켜 둔 채 타임라인·다른 탭으로 오면 감시가 꺼지지 않게 다시 건다(v1.5.1)
+    if (faceDownPref()) flip.ensure();
+  }
   renderFlipChip();
 }
 
@@ -918,6 +1211,7 @@ async function enterLive() {
   }
   setTab("timeline");
   applyDeepLink();
+  restoreFaceDown();                       // 저장된 뒤집어 녹음 설정을 되살린다(v1.5.1)
   checkLocalRecovery().catch(() => {});
   syncNow();
 }
@@ -2142,8 +2436,11 @@ async function renderSettings() {
 
   <div class="sgroup">
     <h2>정보</h2>
-    <div class="srow"><span class="k">버전</span><span class="v">${CONFIG.version}</span></div>
+    <div class="srow"><span class="k">버전</span><span class="v" id="s-version">${CONFIG.version}</span></div>
+    <div class="srow"><span class="k">캐시 키</span><span class="v">hemory-v${esc(CONFIG.version)}</span></div>
     <div class="srow"><span class="k">전사 파이프라인</span><span class="v">맥 자동 처리</span></div>
+    <button class="btn btn-line btn-block" id="s-update">업데이트 확인</button>
+    <p class="note">새 버전이 나오면 이 버튼을 누르거나, 앱을 다시 열었을 때 자동으로 확인해 <b>캐시를 지우고 새로 엽니다</b>. 그래도 예전 화면이 보이면 아래 캐시 비우기를 한 번 눌러 주세요.</p>
   </div>`;
 
   $("#s-sync").addEventListener("click", () => syncNow({ manual: true }));
@@ -2173,6 +2470,13 @@ async function renderSettings() {
     await store.clearAll();
     S.records = []; reindex(); renderTimeline(); renderSettings();
     toast("이 기기 캐시를 비웠습니다");
+  });
+  $("#s-update")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "확인 중…";
+    const r = await checkForUpdate({ force: true });
+    btn.disabled = false; btn.textContent = "업데이트 확인";
+    if (!r.updated && !r.error) toast(`최신 버전입니다 (v${CONFIG.version})`);
   });
   $("#s-demo-exit")?.addEventListener("click", () => { S.mode = null; S.records = []; location.reload(); });
   $("#s-guide")?.addEventListener("click", openShortcutGuide);
@@ -2321,10 +2625,10 @@ function openSetupSheet() {
 }
 
 /* ────────────────────────────────── 녹음 ── */
-function openRecorder() {
+function openRecorder({ autoStart = false } = {}) {
   const R = S.recorder;
-  if (S.auto.on || S.face.active) {
-    return toast("예약·뒤집어 녹음이 진행 중입니다. 먼저 종료해 주세요");
+  if (S.auto.on || S.res.on || S.face.active) {
+    return toast("예약·뒤집어·이어서 녹음이 진행 중입니다. 먼저 종료해 주세요");
   }
   if (R.state !== "idle" && R.state !== "done") { R.cancel(); }
   let saved = null;
@@ -2364,6 +2668,7 @@ function openRecorder() {
     tall: false,
   });
   sheet._rec = true;
+  S.recSheet = sheet;
 
   const timerEl = $("#rec-timer", sheet);
   const stateEl = $("#rec-state", sheet);
@@ -2470,6 +2775,7 @@ function openRecorder() {
     }
     if (R.state === "recording" || R.state === "paused") {
       const out = await R.stop();
+      S.resume.armed = false;        // 직접 멈췄다 → 이어서 녹음 대기 없음
       stopSegTimer();
       stopTimers();
       haptic([10, 40, 10]);
@@ -2512,14 +2818,47 @@ function openRecorder() {
     showSaveForm(sheet, saved, saveArea, () => closeSheet());
   });
 
-  // 시트 닫힐 때 정리
+  // 시트 닫힐 때 정리 — 녹음 중이면 **버리지 않고 담긴 데까지 저장**한다(v1.5.1)
   sheet._onClose = () => {
     stopTimers();
     delRecListener(paint);
-    if (S.recorder.state === "recording" || S.recorder.state === "paused") S.recorder.cancel();
+    S.recSheet = null;
+    S.recStop = null;
+    if (R.state === "recording" || R.state === "paused") quickSaveFromSheet();
     stopSegTimer();
-    if (S.segSession) endLocalSession();
   };
+
+  // 상단 바·FAB 에서 이 시트의 녹음을 정지할 때
+  S.recStop = () => { if (R.state === "recording" || R.state === "paused") mainBtn.click(); };
+
+  // 탭 하나로 바로 녹음 시작(v1.5.1) — 마이크는 호출한 쪽이 제스처 안에서 이미 열었다
+  if (autoStart) {
+    try { mainBtn.click(); }
+    catch (e) { console.warn("auto start", e); toast("녹음을 시작하지 못했습니다 · 아래 시작 버튼을 눌러 주세요"); }
+  }
+}
+
+/* 시트를 내리거나 앱을 떠날 때 — 담긴 데까지 저장 */
+async function quickSaveFromSheet() {
+  const segIndex = S.seg.index;
+  const segStart = S.seg.startAt || Date.now();
+  const out = await S.recorder.stop();
+  stopSegTimer();
+  if (!out || !out.blob?.size) { endLocalSession(); return; }
+  const endAt = Date.now();
+  const label = segmentRangeLabel(segStart, endAt);
+  try {
+    await saveRecordedOut(out, {
+      title: segIndex === 0 ? `새 녹음 ${fmtTime(new Date(segStart).toISOString())}` : `${label} 녹음`,
+      type: localSettings().lastType || "work",
+      startedAt: new Date(segStart).toISOString(),
+      segment: { index: segIndex, start: new Date(segStart).toISOString(), end: new Date(endAt).toISOString(), label },
+    });
+    endLocalSession();
+    toast("녹음을 저장했습니다");
+  } catch {
+    toast("기기에 보관했습니다 · 연결되면 올라갑니다");
+  }
 }
 
 function showSaveForm(sheet, out, area, done) {
@@ -2740,6 +3079,7 @@ async function startAutoRecording(day) {
 
 async function stopAutoRecording({ reason = "end" } = {}) {
   if (!S.auto.on) return;
+  S.resume.armed = false;            // 예약 녹음을 멈추면 '이어서 녹음' 대기도 끝난다
   clearInterval(S.auto.timer);
   S.auto.timer = null;
   stopSegTimer();
@@ -2797,13 +3137,23 @@ async function rescueRecording(reason = "hidden") {
   _rescueBusy = true;
   try {
     const wasAuto = S.auto.on;
+    const wasFace = S.face.active || S.face.pending;
+    const wasRes = S.res.on;
+    const kindType = wasAuto ? (S.auto.type || "work") : wasRes ? (S.res.type || "work") : (localSettings().lastType || "work");
     clearInterval(S.auto.timer);
     S.auto.timer = null;
+    clearInterval(S.res.timer);
+    S.res.timer = null;
     stopSegTimer();
     const segIndex = S.seg.index;
     const segStart = S.seg.startAt || Date.now();
     const out = await R.stop();
     S.auto.on = false;
+    S.res.on = false;
+    renderResBar();
+    /* 떠날 때 녹음 중이었다면 돌아왔을 때 이어서 녹음한다(v1.5.1) —
+       앱 전환으로 iOS 가 캡처를 멈추므로 그때까지는 반드시 저장하되, 세션은 이어진다. */
+    S.resume = { armed: true, kind: wasFace ? "face" : wasAuto ? "auto" : wasRes ? "resume" : "manual", type: kindType, at: Date.now() };
     S.face.active = false;
     S.face.pending = false;
     clearInterval(S.face.timer);

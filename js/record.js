@@ -225,6 +225,7 @@ export class Recorder {
     this.wake = "off"; // off | held | unsupported | denied | released
     this.wakeSentinel = null;
     this._onVis = null;
+    this._wakeTimer = null;
 
     /* VAD */
     this.vad = false;
@@ -480,14 +481,9 @@ export class Recorder {
     this._noise = 0.006;
 
     this.recStream = recorderStream(recStream);
-    this.rec = new MediaRecorder(this.recStream,  this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
-    this.chunks = [];
-    this.rec.ondataavailable = (e) => {
-      if (e.data && e.data.size) {
-        this.chunks.push(e.data);
-        try { this.onPart?.(e.data, this.chunks.length); } catch {}
-      }
-    };
+    const made = this._makeRecorder(this.recStream);
+    this.rec = made.rec;
+    this.chunks = made.chunks;
     this.rec.start(1000);
 
     this.startedAt = Date.now();
@@ -510,6 +506,15 @@ export class Recorder {
       }
     };
     document.addEventListener("visibilitychange", this._onVis);
+    // iOS 는 잠금 상태·메모리 압박에서 워크락을 조용히 풀기도 한다 —
+    //   녹음 중인데 잠금이 풀려 있으면(자동 잠금으로 화면이 꺼지면 녹음이 끊긴다) 다시 건다.
+    clearInterval(this._wakeTimer);
+    this._wakeTimer = setInterval(() => {
+      if (this.state !== "recording" && this.state !== "paused") return;
+      if (document.visibilityState !== "visible") return;
+      if (this.wake === "held" || this.wake === "unsupported") return;
+      this._acquireWakeLock();
+    }, 15000);
     if (this.vad) this._vadLoop();
     this._notify();
   }
@@ -554,6 +559,8 @@ export class Recorder {
   _teardown() {
     clearInterval(this._vadTimer);
     this._vadTimer = null;
+    clearInterval(this._wakeTimer);
+    this._wakeTimer = null;
     this._unbindTrackWatch();
     clearInterval(this._levelTimer);
     this._levelTimer = null;
@@ -569,6 +576,27 @@ export class Recorder {
     // 공유 컨텍스트는 닫지 않는다(다음 녹음에서 다시 쓰려고 깨워 둔 것)
     if (this._ownCtx) { try { this.ctx?.close(); } catch {} }
     this.rec = null; this.stream = null; this.analyser = null; this.ctx = null; this.gate = null; this.dest = null; this.src = null; this.recStream = null;
+  }
+
+  /* MediaRecorder 하나와 그 녹음기의 청크 배열을 함께 만든다(v1.5.1).
+     청크를 인스턴스 배열 하나로 공유하면, 30분 교체 직후 늦게 도착한 마지막
+     dataavailable 이 새 구간 파일에 섞여 m4a 헤더가 깨질 수 있다.
+     녹음기마다 자기 배열만 갖게 해 섞임을 원천적으로 막는다. */
+  _makeRecorder(stream) {
+    const chunks = [];
+    let rec;
+    try {
+      rec = new MediaRecorder(stream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
+    } catch {
+      rec = new MediaRecorder(stream);
+    }
+    rec.ondataavailable = (e) => {
+      if (e.data && e.data.size) {
+        chunks.push(e.data);
+        try { this.onPart?.(e.data, chunks.length); } catch {}
+      }
+    };
+    return { rec, chunks };
   }
 
   /* 30분 세그먼트 교체 — 스트림·게이트·워크락은 그대로 두고 MediaRecorder 만 새로 만든다.
@@ -598,13 +626,9 @@ export class Recorder {
     this.noSignalMs = 0;
     this._sigAlerted = false;
     this.elapsed = 0;
-    this.rec = new MediaRecorder(this.recStream, this.mime ? { mimeType: this.mime, audioBitsPerSecond: 64000 } : undefined);
-    this.rec.ondataavailable = (e) => {
-      if (e.data && e.data.size) {
-        this.chunks.push(e.data);
-        try { this.onPart?.(e.data, this.chunks.length); } catch {}
-      }
-    };
+    const made = this._makeRecorder(this.recStream);
+    this.rec = made.rec;
+    this.chunks = made.chunks;
     this.rec.start(1000);
     this.startedAt = Date.now();
     this.state = "recording";
