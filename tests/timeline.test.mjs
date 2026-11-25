@@ -98,3 +98,16 @@ test("카테고리 워터마크 단어", () => {
   assert.equal(CATEGORY_WORD.study, "STUDY");
   assert.equal(CATEGORY_WORD.etc, "ETC");
 });
+
+test("timelineFlow: 긴 빈 시간이 압축돼도 정시 눈금이 겹치지 않는다", () => {
+  const f = timelineFlow([
+    { id: "a", startMin: 9 * 60 + 16, durationSec: 60 },
+    { id: "b", startMin: 19 * 60 + 54, durationSec: 46 * 60 },
+  ]);
+  const gapTicks = f.ticks.filter((t) => t.min > 9 * 60 + 17 && t.min < 19 * 60 + 54);
+  assert.ok(gapTicks.length >= 3, `눈금이 남아 있다: ${gapTicks.length}`);
+  for (let i = 1; i < gapTicks.length; i++) {
+    assert.ok(gapTicks[i].top - gapTicks[i - 1].top >= 18, `눈금 간격 ${gapTicks[i].top - gapTicks[i - 1].top}px`);
+  }
+  assert.ok(gapTicks.length < 10, "10시간을 1시간 간격으로 다 넣지 않는다");
+});

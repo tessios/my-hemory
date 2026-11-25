@@ -167,9 +167,15 @@ export function timelineFlow(items = [], opts = {}) {
       const gapH = gapMin <= 0 ? o.gapMin : Math.min(o.gapMax, o.gapPx + gapMin * 0.7);
       const top = y;
       if (gapMin > 0) {
-        for (let m = Math.ceil(prev.endMin / 60) * 60; m < it.startMin; m += 60) {
+        // 빈 시간이 길어 압축되면 정시 눈금이 겹친다 → 눈금 간격이 20px 이상 되도록 건너뛴다
+        const hours = [];
+        for (let m = Math.ceil(prev.endMin / 60) * 60; m < it.startMin; m += 60) hours.push(m);
+        const perHour = (gapH / Math.max(1, gapMin / 60));
+        const step = perHour < 20 ? Math.max(1, Math.ceil(20 / Math.max(0.1, perHour))) : 1;
+        hours.forEach((m, i) => {
+          if (i % step) return;
           ticks.push({ min: m, top: top + ((m - prev.endMin) / gapMin) * gapH });
-        }
+        });
       }
       gaps.push({ top, height: gapH, minutes: gapMin });
       y += gapH;
