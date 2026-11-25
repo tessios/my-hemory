@@ -185,7 +185,7 @@ export function timelineFlow(items = [], opts = {}) {
   let ty = y;
   for (let k = 1; k <= 2; k++) {
     const m = lastH + k * 60;
-    if (m > 1440) break;
+    if (m >= 1440) break;
     ty += 20;
     ticks.push({ min: m, top: ty });
   }
