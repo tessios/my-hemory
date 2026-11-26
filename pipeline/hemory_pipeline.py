@@ -53,7 +53,7 @@ LOCK_STALE_SEC = 3 * 3600          # 이보다 오래된 락은 죽은 실행으
 GROWING_SKIP_SEC = 10              # 방금 올라온 파일은 이만큼 기다렸다 집는다(업로드 중 잘린 파일 방지)
 GROWING_STABLE_SEC = 4            # 상주 감시에서 크기가 이만큼 지켜봐도 같아야 다 올라온 것으로 본다
 WATCH_INTERVAL_SEC = 15            # 상주 감시 폴링 간격(초)
-WATCH_HEARTBEAT_SEC = 600          # 조용할 때 대기 로그를 남기는 간격(초)
+WATCH_HEARTBEAT_SEC = 300          # 조용할 때 대기 로그를 남기는 간격(초)
 PRUNE_INTERVAL_SEC = 3600          # 상주 감시 중 365일 정리를 다시 도는 간격(초)
 RESUMMARIZE_INTERVAL_SEC = 1800    # 상주 감시 중 '요약이 빈 기록'을 다시 채우는 간격(초)
 DEADMAN_SEC = 3 * 3600             # 마지막 성공이 이보다 오래되면 경고
@@ -102,9 +102,23 @@ def acquire_lock():
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         if LOCK_PATH.exists():
             age = time.time() - LOCK_PATH.stat().st_mtime
-            if age > LOCK_STALE_SEC:
+            stale = age > LOCK_STALE_SEC
+            if not stale:
+                # 죽은 프로세스가 남긴 락이면 지운다(KeepAlive 재시작 시 3시간 막히는 것을 막는다)
+                try:
+                    pid = int(LOCK_PATH.read_text().strip() or 0)
+                except Exception:
+                    pid = 0
+                if pid and pid != os.getpid():
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        stale = True
+                    except PermissionError:
+                        pass
+            if stale:
                 LOCK_PATH.unlink(missing_ok=True)
-                log(f"오래된 락 파일 정리({int(age/60)}분)")
+                log(f"오래됐거나 죽은 실행의 락 파일 정리({int(age/60)}분)")
             else:
                 return None
         fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -999,9 +1013,16 @@ def scan_inbox(be, cfg: dict, need_stable: bool = False, quiet: bool = False) ->
         it["from_inbox"] = True
         items.append(it)
     # 월 폴더에 오디오만 있고 JSON 이 없는 경우(업로드 중단·수동 복사)도 복구
+    #   (JSON 이름은 폴더마다 한 번에 읽어 온다 — 파일마다 드라이브를 묻으면 회차가 20초씩 길어진다)
     for folder_id, _name in list_month_folders(be):
+        try:
+            have = {j["base"] for j in be.list_json(folder_id)} if hasattr(be, "list_json") else set()
+        except Exception:
+            have = set()
         for it in be.list_audio(folder_id):
-            if not be.has_json(folder_id, it["base"]) and not _too_fresh(it, need_stable=need_stable):
+            if it["base"] in have:
+                continue
+            if not _too_fresh(it, need_stable=need_stable):
                 it["from_inbox"] = False
                 items.append(it)
     return items
