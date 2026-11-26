@@ -69,9 +69,12 @@ self.addEventListener("fetch", (e) => {
   const networkFirst = isDoc || NETWORK_FIRST.test(url.pathname);
 
   if (networkFirst) {
-    // 새 버전이 바로 반영되도록 네트워크부터, 실패하면 캐시
+    // 새 버전이 바로 반영되도록 네트워크부터, 실패하면 캐시.
+    //   cache:'no-cache' — 브라우저 HTTP 캐시(깃허브 페이지는 max-age=600)에 남은
+    //   옛 config.js·app.js 를 그대로 쓰지 않고 서버에 재검사를 받는다.
+    //   (이게 없으면 새 index 를 받아도 안쪽 모듈이 옛 버전이라 버전 판정이 어긋난다)
     e.respondWith(
-      fetch(req).then((res) => {
+      fetch(req, { cache: "no-cache" }).then((res) => {
         if (res && res.ok) {
           const copy = res.clone();
           caches.open(VERSION).then((c) => c.put(req, copy)).catch(() => {});
