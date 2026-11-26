@@ -14,7 +14,7 @@ import { micResumePlan, afterUnmuteWait, meterVerdict } from "./lifecycle.js";
 
 const MIC_CONSTRAINTS = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
 
-const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set(), backgrounded: false, reopening: null, opening: null };
+const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set(), backgrounded: false, reopening: null, opening: null, epoch: 0 };
 
 /* 이 사이트에서 마이크를 한 번이라도 연 적이 있는가 — 안내 문구 선택에만 쓴다(권한 판정 아님). */
 const MIC_ALLOWED_KEY = "hemory.micAllowed";
@@ -96,6 +96,7 @@ function openMicShared(opts = {}) {
 async function openMic({ stopOld = true } = {}) {
   // 죽었거나 끊긴 트랙은 버리고 새로 연다.
   //   stopOld=false: muted(일시 인터럽트) 트랙은 stop() 하지 않는다 — 새 트랙을 받은 뒤에 정리한다.
+  const epoch = mic.epoch;
   const old = mic.stream;
   if (old) { mic.stream = null; mic.boundTrack = null; }
   if (old && stopOld) {
@@ -103,6 +104,10 @@ async function openMic({ stopOld = true } = {}) {
   }
   try {
     const s = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+    if (epoch !== mic.epoch) {          // 기다리는 동안 사용자가 기능을 껐다 — 받은 스트림은 바로 닫는다
+      try { s.getTracks().forEach((x) => x.stop()); } catch {}
+      return { ok: false, reason: "released" };
+    }
     mic.stream = s;
     mic.state = "live";
     markMicAllowed();            // 다음 실행에서 '탭 없이 시도해도 되는가'의 근거
@@ -187,6 +192,7 @@ export async function resumeMicAfterBackground({ waitMs = 1200 } = {}) {
 
 /* 마이크를 완전히 닫는다 — 뒤집어 녹음 기능을 끌 때만. 앱을 떠날 때는 닫지 않는다(v1.5). */
 export function releaseMic() {
+  mic.epoch++;                          // 진행 중인 getUserMedia 결과를 버리게 한다
   if (mic.stream) { try { mic.stream.getTracks().forEach((x) => x.stop()); } catch {} }
   mic.stream = null;
   mic.boundTrack = null;

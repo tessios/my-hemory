@@ -3533,8 +3533,7 @@ async function refreshQueue({ force = false } = {}) {
   if (Date.now() - _queueRefreshAt < 2000 && !force) return;
   _queueRefreshAt = Date.now();
   try {
-    const items = await store.pendingAll();
-    S.queue.count = items.length;
+    S.queue.count = await store.pendingCount();   // Blob 을 읽지 않고 개수만 — 30초마다 불러도 가볍다
   } catch { return; }
   renderQueueDot();
 }

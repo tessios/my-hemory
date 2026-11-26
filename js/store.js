@@ -65,6 +65,7 @@ export const store = {
 
   /* 업로드 대기 (오프라인) */
   async pendingAll() { return (await tx("pending", "readonly", (s) => s.getAll())) || []; },
+  async pendingCount() { return Number(await tx("pending", "readonly", (s) => s.count())) || 0; },
   async pendingPut(item) { await tx("pending", "readwrite", (s) => s.put(item)); },
   async pendingDel(id) { await tx("pending", "readwrite", (s) => s.delete(id)); },
   async pendingDelBase(base) {
