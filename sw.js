@@ -6,7 +6,7 @@
    v1.4.1: 뒤집어 녹음 마이크 연결 유지(스트림 재사용·keepMic) — 엎을 때마다 재세팅하지 않는다.
    v1.4.0: 30분 세그먼트·선택 삭제·Blob 재생·무음 감지(js/pure.js 추가).
    v1.3.2: 네트워크 우선으로 바꿔 새 버전이 다음 실행에 바로 반영되게 했다. */
-const VERSION = "hemory-v1.5.1";
+const VERSION = "hemory-v1.5.2";
 const SHELL = [
   "./",
   "./index.html",
