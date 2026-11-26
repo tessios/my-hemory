@@ -1209,6 +1209,17 @@ function bindGlobal() {
   };
   document.addEventListener("pointerdown", wakeRecorderAudio, { passive: true });
   document.addEventListener("touchstart", wakeRecorderAudio, { passive: true });
+  /* v1.7: 대기 중 마이크 레벨은 이미 깨어 있는 AudioContext 가 있어야 잰다.
+     첫 터치(제스처)에서 한 번 깨워 두면 이후 대기 중에도 레벨이 보인다. */
+  const unlockOnce = () => {
+    try { unlockAudio(); } catch {}
+    document.removeEventListener("pointerdown", unlockOnce, true);
+    document.removeEventListener("touchend", unlockOnce, true);
+    document.removeEventListener("keydown", unlockOnce, true);
+  };
+  document.addEventListener("pointerdown", unlockOnce, true);
+  document.addEventListener("touchend", unlockOnce, true);
+  document.addEventListener("keydown", unlockOnce, true);
   if ("serviceWorker" in navigator) {
     let swReloaded = false;
     const hadController = !!navigator.serviceWorker.controller;

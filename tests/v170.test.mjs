@@ -231,6 +231,8 @@ test("마이크를 열면 '허용한 적 있음'을 기억한다 — 다음 실�
   assert.equal(r.ok, true);
   assert.equal(rec.micEverAllowed(), true);
   assert.equal(rec.micStatus().live, true);
+  // 제스처로 AudioContext 를 깨우기 전에는 레벨을 '무음'이라 적지 않고 '측정 대기'로 둔다
+  assert.equal(rec.micMeterRead().state, "waiting");
 });
 
 test("동시에 두 번 요청해도 getUserMedia 는 한 번만 나간다(스트림 2개 방지)", async () => {

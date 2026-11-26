@@ -212,7 +212,9 @@ function detachMeter() {
 
 function attachMeter(track) {
   detachMeter();
-  const ctx = unlockAudio();
+  /* 제스처 없이 AudioContext 를 새로 만들지는다 — iOS 에서 어차피 suspended 로 남아
+     레벨이 0 으로만 보이고, '무음' 오해를 만든다. 이미 깨어 있는 컨텍스트가 있을 때만 붙인다. */
+  const ctx = audioContextIfAny();
   if (!ctx || !mic.stream) return;
   try {
     const src = ctx.createMediaStreamSource(mic.stream);
@@ -289,6 +291,10 @@ export async function prewarmMic() {
    iOS 는 제스처 밖에서 만든 AudioContext 가 'suspended' 로 남아 VAD 레벨 측정이 꺼진다.
    한 번 깨운 컨텍스트는 이후(센서·예약으로 시작한 녹음에서도) 계속 쓸 수 있다. */
 let sharedCtx = null;
+/** 이미 만들어진 공유 AudioContext (없으면 null — 새로 만들지 않는다) */
+export function audioContextIfAny() {
+  try { return sharedCtx && sharedCtx.state !== "closed" ? sharedCtx : null; } catch { return null; }
+}
 export function unlockAudio() {
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
