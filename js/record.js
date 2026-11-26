@@ -233,6 +233,10 @@ export class Recorder {
     this.dest = null;
     this.speaking = false;
     this.speechSec = 0;
+    this.wantVad = false;          // v1.6.1: 측정을 '원함'과 '지금 측정 중'을 나눈다
+    this.speechFromSec = null;     // 측정을 시작한 시점(녹음 시작 이후 초) — 그 전 구간은 안 셌다
+    this.gaps = [];                // 마이크가 끊긴 구간 [{from,to}] — 녹음 중 mute/복구
+    this._ctxWatch = null;
     this._open = false;
     this._noise = 0.006;
     this._silentMs = 0;
@@ -351,6 +355,10 @@ export class Recorder {
     const dt = Math.min(0.2, Math.max(0, (now - this._lastTick) / 1000));
     this._lastTick = now;
     if (this.state !== "recording") return; // 사용자가 일시정지·정지한 동안은 세지 않음
+    if (!this.ctxRunning) {                 // 컨텍스트가 죽어 있으면 살아날 때까지 세지 않는다
+      if (this.ctx?.state === "running" || this.tryResumeAudio()) this._onCtxRunning();
+      return;
+    }
 
     const rms = this._rms();
     const thr = Math.max(this._noise * 1.8, 0.006);
@@ -401,7 +409,12 @@ export class Recorder {
   _bindTrackWatch() {
     const t = this.stream?.getAudioTracks?.()[0];
     if (!t) return;
-    this._onTrackMute = () => { try { this.onSignalAlert?.({ ms: 0, track: this._trackHealth() }); } catch {} };
+    // iOS 가 오디오 세션을 끊은 구간(전화·Siri·잠금)은 메타데이터로 남긴다 — 소리가 없는 구간을
+    //   "말을 안 한 구간"과 구분하기 위해서다(Claude 검토 반영, v1.6.1).
+    this._onTrackMute = () => {
+      try { this.gaps.push({ from: Math.round(this.elapsedSec()) }); } catch {}
+      try { this.onSignalAlert?.({ ms: 0, track: this._trackHealth() }); } catch {};
+    };
     this._onTrackEnd = () => { try { this.onSignalAlert?.({ ms: 0, track: this._trackHealth() }); } catch {} };
     try {
       t.addEventListener("mute", this._onTrackMute);
@@ -437,8 +450,7 @@ export class Recorder {
   }
 
   /* ── 녹음 ───────────────────────────────────────────────── */
-  async start({ vad = false, keepMic = true } = {}) {
-    if (!Recorder.supported) throw new Error("이 브라우저에서는 녹음을 지원하지 않습니다.");
+  async start({ vad = false, keepMic = true } = {}) {    if (!Recorder.supported) throw new Error("이 브라우저에서는 녹음을 지원하지 않습니다.");
     // v1.4.1: 새 스트림을 열지 않고 대여 중인 마이크를 그대로 쓴다.
     //   (iOS 는 트랙을 닫으면 권한을 풀어, 사용자 터치 없는 다음 시작을 막는다)
     this.keepMic = !!keepMic;
@@ -465,6 +477,12 @@ export class Recorder {
     this.analyser.fftSize = 512;
     this.analyser.smoothingTimeConstant = 0.2;
     src.connect(this.analyser);
+    // v1.6.1: 예약·엎기처럼 사용자 제스처 없이 시작하면 iOS 가 AudioContext 를
+    //   suspend/'interrupted' 로 두어 레벨·VAD 가 0 이 된다(화면에 "말한 구간 00:00").
+    //   wantVad 로 '원함'을 기억해 두고, 무음 버퍼 kick·2초 재시도·첫 제스처에서 깨워
+    //   살아나는 순간부터 말한 구간을 세기 시작한다(그 전 구간은 speechFromSec 으로 남김).
+    this.wantVad = !!vad && Recorder.vadSupported;
+    if (!this.ctxRunning) this._bindCtxState();   // 'interrupted'→running 자동 복귀를 바로 잡는다
 
     // v1.4: 녹음은 **마이크 원본 스트림**을 그대로 담는다.
     //   예전에는 VAD 게이트(src→gain→MediaStreamDestination)를 거친 스트림을 녹음했는데,
@@ -472,7 +490,8 @@ export class Recorder {
     //   destination 스트림이 **무음을 출력**했고, 그게 그대로 저장됐다(18초/6.3kbps 사고).
     //   이제 VAD 는 녹음 경로에 끼지 않고 '말한 구간(speechSec)'만 세는 참고 정보다.
     //   침묵 제거는 전사 단계(whisper VAD)에서 한다.
-    this.vad = !!vad && Recorder.vadSupported && this.ctxRunning;
+    this.vad = this.wantVad && this.ctxRunning;
+    this.speechFromSec = this.vad ? 0 : null;
     const recStream = this.stream;
     this.speaking = false;
     this.speechSec = 0;
@@ -515,7 +534,71 @@ export class Recorder {
       if (this.wake === "held" || this.wake === "unsupported") return;
       this._acquireWakeLock();
     }, 15000);
-    if (this.vad) this._vadLoop();
+    if (this.wantVad) { this._vadLoop(); this._startCtxWatch(); }
+    this._notify();
+  }
+
+  /* ── AudioContext 살리기 (v1.6.1) ─────────────────────────
+     iOS 는 제스처 없이 만든/되살린 컨텍스트를 'suspended'·'interrupted' 로 둔다.
+     무음 1샘플 버퍼를 재생해 보는 것이 Safari 에서 통하는 경우가 있어 먼저 시도하고,
+     그래도 안 되면 2초마다 재시도한다(브라우저가 스스로 풀리는 경우도 있다). */
+  _kickCtx() {
+    const c = this.ctx;
+    if (!c) return false;
+    try {
+      const b = c.createBuffer(1, 1, 22050);
+      const s = c.createBufferSource();
+      s.buffer = b;
+      s.connect(c.destination);
+      s.start(0);
+    } catch {}
+    try { c.resume?.().catch(() => {}); } catch {}
+    return c.state === "running";
+  }
+
+  /** 지금 컨텍스트를 살려 본다. 제스처 핸들러에서 불러도 안전하다. */
+  tryResumeAudio() {
+    if (this.state === "idle" || this.state === "done" || !this.ctx) return this.ctxRunning;
+    if (this.ctx.state === "running") { this.ctxRunning = true; if (this.wantVad && !this.vad) this._onCtxRunning(); return true; }
+    const ok = this._kickCtx();
+    if (ok) { this.ctxRunning = true; if (this.wantVad && !this.vad) this._onCtxRunning(); }
+    return ok;
+  }
+
+  /* WebKit 은 'interrupted' 가 풀리면 스스로 running 으로 돌아오는 경우가 많다 — 이벤트를 먼저 듣는다. */
+  _bindCtxState() {
+    try {
+      this.ctx.onstatechange = () => {
+        if (this.ctx?.state === "running") {
+          this.ctxRunning = true;
+          if (this.wantVad && !this.vad) this._onCtxRunning();
+        }
+      };
+    } catch {}
+  }
+
+  _startCtxWatch() {
+    if (this._ctxWatch) return;
+    this._ctxWatch = setInterval(() => {
+      if (this.state !== "recording" && this.state !== "paused") { clearInterval(this._ctxWatch); this._ctxWatch = null; return; }
+      if (this.ctxRunning) { clearInterval(this._ctxWatch); this._ctxWatch = null; return; }
+      if (this.tryResumeAudio()) this._onCtxRunning();
+    }, 2000);
+  }
+
+  /* 컨텍스트가 살아났다: 측정을 이 시점부터 시작한다(suspend 동안 쌓인 레벨은 믿지 않는다). */
+  _onCtxRunning() {
+    if (this.vad) return;
+    this.ctxRunning = true;
+    this.vad = true;
+    this.speechFromSec = Math.max(0, Math.round(this.elapsedSec ? this.elapsedSec() : 0));
+    this.speechSec = 0;
+    this._lastTick = Date.now();
+    this._silentMs = 0;
+    this._noise = 0.006;
+    this.maxRms = Math.max(this.maxRms || 0, 0);
+    // suspend 중에 connect 해 둔 analyser 는 resume 하면 그대로 동작한다(다시 만들 필요 없음).
+    this._vadLoop();
     this._notify();
   }
 
@@ -559,6 +642,8 @@ export class Recorder {
   _teardown() {
     clearInterval(this._vadTimer);
     this._vadTimer = null;
+    clearInterval(this._ctxWatch);
+    this._ctxWatch = null;
     clearInterval(this._wakeTimer);
     this._wakeTimer = null;
     this._unbindTrackWatch();
@@ -606,6 +691,7 @@ export class Recorder {
     const duration = (Date.now() - this.startedAt) / 1000;
     this.elapsed += duration;
     const speech = this.vad ? Math.min(this.speechSec, duration) : null;
+    const from = this.vad ? (this.speechFromSec ?? 0) : null;
     const maxRms = this.maxRms;
     const silentAlerted = this._sigAlerted;
     const prev = this.rec;
@@ -622,6 +708,7 @@ export class Recorder {
 
     this.chunks = [];
     this.speechSec = 0;
+    this.speechFromSec = this.vad ? 0 : null;
     this.maxRms = this.ctxRunning ? 0 : null;
     this.noSignalMs = 0;
     this._sigAlerted = false;
@@ -634,7 +721,7 @@ export class Recorder {
     this.state = "recording";
     if (this.vad) { this._lastTick = Date.now(); this._setGate(true); }
     this._notify();
-    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, maxRms, silentAlerted };
+    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, speechFromSec: from, maxRms, silentAlerted };
   }
 
   async stop() {
@@ -642,6 +729,7 @@ export class Recorder {
     if (this.state === "recording") this.elapsed += (Date.now() - this.startedAt) / 1000;
     const duration = this.elapsed;
     const speech = this.vad ? Math.min(this.speechSec, duration) : null;
+    const from = this.vad ? (this.speechFromSec ?? 0) : null;
     const rec = this.rec;
     await new Promise((resolve) => {
       let done = false;
@@ -657,7 +745,7 @@ export class Recorder {
     this.state = "done";
     this._teardown();
     this._notify();
-    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, maxRms, silentAlerted };
+    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, speechFromSec: from, maxRms, silentAlerted };
   }
 
   cancel() {
@@ -669,9 +757,16 @@ export class Recorder {
     this.state = "idle";
     this.elapsed = 0;
     this.speechSec = 0;
+    this.speechFromSec = null;
+    this.wantVad = false;
     this.speaking = false;
     this._open = false;
     this._notify();
+  }
+
+  /* VAD 배지·예약 바에서 "0초"로 단정하지 않기 위한 표시용 */
+  get speechReady() {
+    return !!(this.wantVad && this.vad && this.ctxRunning);
   }
 }
 

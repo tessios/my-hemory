@@ -776,6 +776,8 @@ def summarize(segs: list[dict], cfg: dict, hint: str = "") -> dict:
 def build_record(item: dict, segs: list[dict], info: dict, summary: dict, diar: str,
                  type_hint: str | None, started: dt.datetime, data_len: int) -> dict:
     dur = max([s.get("end") or s.get("start") or 0 for s in segs], default=0)
+    # whisper VAD 를 거친 구간의 합 = '말한 구간'의 정식 값(앱의 실시간 측정과 별개, v1.6.1)
+    speech = sum(max(0.0, (s.get("end") or 0) - (s.get("start") or 0)) for s in segs)
     rid = item["base"]
     title = summary.get("title") or f"{started:%m월 %d일} 기록"
     rtype = type_hint or summary.get("type") or "etc"
@@ -788,6 +790,7 @@ def build_record(item: dict, segs: list[dict], info: dict, summary: dict, diar: 
         "type": rtype,
         "started_at": iso_local(started),
         "duration_sec": int(round(dur)),
+        "speech_sec": int(round(speech)),
         "source": "iphone" if item.get("from_inbox") else "web",
         "status": "done",
         "language": info.get("language", "ko"),

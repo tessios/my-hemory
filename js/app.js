@@ -569,7 +569,7 @@ async function segRotate() {
   try {
     await saveRecordingFast({
       blob: out.blob, duration: out.duration, mime: out.mime, title,
-      type: S.seg.type, speechSec: out.speechSec,
+      type: S.seg.type, speechSec: out.speechSec, speechFromSec: out.speechFromSec,
       started_at: new Date(startAt).toISOString(),
       segment: { index, start: new Date(startAt).toISOString(), end: new Date(endAt).toISOString(), label },
     });
@@ -586,7 +586,7 @@ async function saveRecordedOut(out, { title, type, startedAt, segment } = {}) {
   const finalTitle = verdict.silent ? `${title} · 무음` : title;
   await saveRecordingFast({
     blob: out.blob, duration: out.duration, mime: out.mime, title: finalTitle,
-    type, speechSec: out.speechSec, started_at: startedAt, segment,
+    type, speechSec: out.speechSec, speechFromSec: out.speechFromSec, started_at: startedAt, segment,
   });
   if (verdict.silent) {
     toast(verdict.reason === "no_signal"
@@ -1041,6 +1041,17 @@ function bindGlobal() {
   }));
 
   window.addEventListener("online", () => { if (S.mode === "live") syncNow(); });
+  /* v1.6.1: 예약·엎기로 제스처 없이 시작한 녹음은 iOS 가 AudioContext 를 잠가
+     "말한 구간"이 잡히지 않는다. 앱 안의 첫 탭(제스처)에서 바로 깨우고,
+     화면 복귀·앞으로 오기에서도 깨운다(비용이 거의 없고 녹음에는 영향 없음). */
+  const wakeRecorderAudio = () => {
+    const R = S.recorder;
+    if (!R || (R.state !== "recording" && R.state !== "paused")) return;
+    try { R.tryResumeAudio?.(); } catch {}
+    renderAutoBar();
+  };
+  document.addEventListener("pointerdown", wakeRecorderAudio, { passive: true });
+  document.addEventListener("touchstart", wakeRecorderAudio, { passive: true });
   if ("serviceWorker" in navigator) {
     let swReloaded = false;
     const hadController = !!navigator.serviceWorker.controller;
@@ -1097,6 +1108,7 @@ function bindGlobal() {
       S.swReg?.update?.().catch(() => {});
       checkForUpdate().catch(() => {});     // 새 버전이면 캐시를 지우고 새로 연다
       autoSyncNow({ force: true });         // 돌아오면 바로 최신 전사·요약을 반영한다(v1.6)
+      wakeRecorderAudio();                  // 녹음 중이면 잠긴 AudioContext 도 깨운다(v1.6.1)
     }
   });
   window.addEventListener("pagehide", () => { rescueRecording("pagehide"); markBackgrounded(); });
@@ -2739,6 +2751,9 @@ function openRecorder({ autoStart = false } = {}) {
     if (R.vad || (vad && vadOK && !recording() && R.state === "idle")) {
       const t = recording() || R.state === "done" ? ` · 말한 구간 ${fmtClock(R.speechSec || 0)}` : "";
       bits.push(`<span class="rec-badge${recording() && R.speaking ? " on" : ""}">VAD${t}</span>`);
+    } else if (recording() && R.wantVad) {
+      // v1.6.1: iOS 가 AudioContext 를 잠가 아직 못 재고 있음 — 0초로 단정하지 않는다
+      bits.push(`<span class="rec-badge">말한 구간 확인 중</span>`);
     }
     if (!bits.length) bits.push(`<span class="rec-badge">말한 구간만 담기 · 화면 꺼짐 방지</span>`);
     badgesEl.innerHTML = bits.join("");
@@ -2935,7 +2950,7 @@ function showSaveForm(sheet, out, area, done) {
     btn.innerHTML = '<span class="spinner"></span>';
     try {
       saveSettings({ lastType: type });   // 다음 30분 세그먼트의 유형으로 기억
-      await saveRecording({ blob: out.blob, duration: out.duration, mime: out.mime, name: out.name, title, type, speechSec: out.speechSec });
+      await saveRecording({ blob: out.blob, duration: out.duration, mime: out.mime, name: out.name, title, type, speechSec: out.speechSec, speechFromSec: out.speechFromSec });
       toast("저장했습니다");
       done();
     } catch (err) {
@@ -2956,7 +2971,7 @@ function recInfo(out) {
   return bits.join(" · ");
 }
 
-async function saveRecording({ blob, duration, mime, name, title, type, speechSec }) {
+async function saveRecording({ blob, duration, mime, name, title, type, speechSec, speechFromSec }) {
   const ext = extFor(mime || blob.type, name || "");
   const base = `${stamp()}_${type}_${uid(6)}`;
   const fileName = `${base}.${ext}`;
@@ -2968,6 +2983,9 @@ async function saveRecording({ blob, duration, mime, name, title, type, speechSe
     started_at: new Date(Date.now() - (duration || 0) * 1000).toISOString(),
     duration_sec: Math.round(duration || 0),
     speech_sec: speechSec != null ? Math.round(speechSec) : undefined,
+    speech_from_sec: speechSec != null && speechFromSec ? Math.round(speechFromSec) : undefined,
+    speech_sec_live: speechSec != null ? Math.round(speechSec) : undefined,
+    gaps: (S.recorder.gaps || []).length ? S.recorder.gaps.slice() : undefined,
     source: "web",
     status: "pending",
     language: "ko",
@@ -3083,11 +3101,12 @@ function renderAutoBar() {
   const d = getSchedule().days[DAY_KEYS[now.getDay()]] || {};
   const el = (Date.now() - S.auto.startedAt) / 1000;
   const speech = S.recorder.speechSec || 0;
+  const ready = S.recorder.speechReady;
   bar.hidden = false;
   bar.classList.add("show");
   bar.innerHTML = `<span class="ab-dot"></span>
     <div class="ab-main"><b>예약 녹음 중</b>
-      <span>${esc(d.start || "")}~${esc(d.end || "")} · ${fmtClock(el)} · 말한 구간 ${fmtClock(speech)}</span></div>
+      <span>${esc(d.start || "")}~${esc(d.end || "")} · ${fmtClock(el)} · 말한 구간 ${ready ? fmtClock(speech) : "확인 중"}${ready && (S.recorder.speechFromSec || 0) > 0 ? ` (측정 ${fmtClock(S.recorder.speechFromSec)}부터)` : ""}</span></div>
     <button class="ab-stop" id="ab-stop">종료</button>`;
   $("#ab-stop", bar).addEventListener("click", () => stopAutoRecording({ reason: "manual" }));
 }
