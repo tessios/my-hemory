@@ -475,6 +475,7 @@ input,textarea{font:inherit;color:inherit}
 .so-txt{font-size:12px;letter-spacing:.2em}
 .so-time{font-size:12px;font-variant-numeric:tabular-nums;color:#585858}
 .so-hint{position:absolute;bottom:calc(var(--sb) + 30px);font-size:10.5px;color:#3a3a3a;letter-spacing:.04em}
+.so-hint.warn{color:#b9c79b;font-size:11.5px;letter-spacing:0}
 @keyframes sopulse{0%,100%{opacity:.22}50%{opacity:.85}}
 
 /* 예약 녹음 설정 */

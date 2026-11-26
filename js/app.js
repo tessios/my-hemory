@@ -734,6 +734,16 @@ function updateSleepOverlay() {
       ? fmtClock((Date.now() - S.face.startedAt) / 1000)
       : S.face.pending ? "—" : fmtClock(0);
   }
+  /* v1.5.2 — 화면 꺼짐 방지가 안 걸린 채로 녹음 중이면(아이폰 홈화면 앱 iOS 18.4 미만·저전력 모드)
+     자동 잠금으로 화면이 꺼지는 순간 iOS 가 마이크를 끊는다. 검은 화면에는 이 경고밖에 보이지 않는다. */
+  const hint = el.querySelector(".so-hint");
+  if (hint) {
+    const warn = S.face.active && Recorder.wakeSupported && S.recorder.wake !== "held";
+    hint.textContent = warn
+      ? "화면이 꺼지면 녹음이 끊깁니다 · 설정 > 화면 자동 잠금 '안 함'"
+      : "들면 자동으로 저장합니다";
+    hint.classList.toggle("warn", !!warn);
+  }
   renderFlipChip();
 }
 
@@ -2687,6 +2697,7 @@ function openRecorder({ autoStart = false } = {}) {
   function paint() {
     const bits = [];
     if (R.wake === "held") bits.push(`<span class="rec-badge on">화면 꺼짐 방지 켜짐</span>`);
+    else if (recording() && (R.wake === "denied" || R.wake === "released")) bits.push(`<span class="rec-badge">화면 꺼짐 방지 안 됨 · 화면이 꺼지면 끊깁니다</span>`);
     else if (recording()) bits.push(`<span class="rec-badge">화면 꺼짐 방지 대기</span>`);
     else if (!wakeOK) bits.push(`<span class="rec-badge">화면 꺼짐 방지 미지원</span>`);
     if (R.vad || (vad && vadOK && !recording() && R.state === "idle")) {
