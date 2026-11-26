@@ -10,6 +10,7 @@ import { flipBootPlan, resumePlan, RESUME_GAP_MS } from "./flow.js";
 import {
   previewLine, segmentRangeLabel, segmentDue, groupTranscript, silentVerdict, recordSegmentLabel, SEGMENT_SEC,
   timelineFlow, weekDays, dateKeyOf, blockRangeLabel, CATEGORY_WORD, minutesOf, hhmm,
+  autoSyncDue, recordSignature, AUTO_SYNC_TICK_MS,
 } from "./pure.js";
 import { sensorResumePlan, sensorQuietLabel, SENSOR_QUIET_MS } from "./lifecycle.js";
 import {
@@ -424,6 +425,24 @@ function recorderIdle() {
 function recordingNow() {
   const st = S.recorder.state;
   return st === "recording" || st === "paused";
+}
+
+/* ── 자동 반영 (v1.6) ─────────────────────────────────
+   맥이 상주 감시(15초)로 _inbox 를 전사·요약하므로, 앱을 켜 둔 채로도
+   "전사 대기" 항목이 곧 실제 기록으로 바뀐다. 5초마다 조건만 보고,
+   조건이 맞을 때만 드라이브를 다시 읽는다(녹음 중·화면 가려짐·동기화 중 제외). */
+function autoSyncNow({ force = false } = {}) {
+  const due = autoSyncDue({
+    now: Date.now(),
+    lastSync: S.lastSync,
+    syncState: S.syncState,
+    mode: S.mode,
+    visibility: document.visibilityState,
+    recording: recordingNow() || S.face.active || S.auto.on || S.res.on || !!S.recSheet,
+    records: S.records,
+    force,
+  });
+  if (due) syncNow({ auto: true }).catch(() => {});
 }
 
 function startQuickRecording() {
@@ -1077,6 +1096,7 @@ function bindGlobal() {
       paintPill();
       S.swReg?.update?.().catch(() => {});
       checkForUpdate().catch(() => {});     // 새 버전이면 캐시를 지우고 새로 연다
+      autoSyncNow({ force: true });         // 돌아오면 바로 최신 전사·요약을 반영한다(v1.6)
     }
   });
   window.addEventListener("pagehide", () => { rescueRecording("pagehide"); markBackgrounded(); });
@@ -1084,10 +1104,11 @@ function bindGlobal() {
     // bfcache·프로세스 재개로 돌아온 경우: 권한을 다시 묻지 않고 감시만 되살린다
     if (!e.persisted) { renderFlipChip(); return; }
     resumeAfterBackground();
+    autoSyncNow({ force: true });
   });
   // focus 는 visibilitychange 를 놓치는 경우(데스크톱·안드로이드 브라우저)의 보조 신호
   window.addEventListener("focus", debounce(() => {
-    if (document.visibilityState === "visible") resumeAfterBackground();
+    if (document.visibilityState === "visible") { resumeAfterBackground(); autoSyncNow({ force: true }); }
   }, 700));
 
   /* 절전 오버레이를 탭하면 바로 종료·저장(시작이 막혀 있으면 시작) */
@@ -1135,6 +1156,9 @@ function bindGlobal() {
 
   /* 예열: 예약 녹음 20초마다 확인, 뒤집어 녹음은 첫 탭에서 센서 권한 */
   setInterval(schedTick, 20000);
+  /* 자동 반영(v1.6): 5초마다 조건만 보고, 전사·요약 대기 중이면 20초·아니면 30초마다
+     드라이브를 다시 읽는다. 녹음 중·화면 가려짐·동기화 중에는 건너뛴다. */
+  setInterval(() => autoSyncNow(), AUTO_SYNC_TICK_MS);
   /* 마이크 연결 유지 감시(v1.4.1) — 엎기 대기 중에 트랙이 조용해졌으면 다시 잡는다.
      실패하면 간격을 늘려 iOS 에 권한 질문을 연속으로 던지지 않는다. */
   onMicChange(() => { renderFlipChip(); paintFlipReadout(); });
@@ -1273,10 +1297,12 @@ function normalizeDemo(r, i) {
 }
 
 /* ────────────────────────────────── 동기화 ── */
-async function syncNow({ manual = false } = {}) {
+async function syncNow({ manual = false, auto = false } = {}) {
   if (S.mode !== "live" || S.syncState === "syncing") return;
   S.syncState = "syncing";
-  syncSpin(true);
+  if (!auto) syncSpin(true);
+  const beforeSig = recordSignature(S.records);
+  const beforePending = new Set(S.records.filter((r) => r.status === "pending").map((r) => r.base));
   try {
     const { files } = await drive.listTree();
     const audioRe = /\.(m4a|mp3|wav|aac|caf|ogg|opus|webm)$/i;
@@ -1317,16 +1343,24 @@ async function syncNow({ manual = false } = {}) {
     }
 
     S.records = next.sort(byRecent);
-    reindex();
-    await store.replaceAll(S.records.filter((r) => !r.demo)).catch(() => {});
+    const changed = recordSignature(S.records) !== beforeSig;
+    if (changed) {
+      reindex();
+      await store.replaceAll(S.records.filter((r) => !r.demo)).catch(() => {});
+      renderTimeline();
+      if (S.tab === "search") renderSearch();
+    }
     hideConnBar();
     S.lastSync = Date.now();
     await store.setKV("lastSync", S.lastSync).catch(() => {});
     flushPending().catch(() => {});
     S.syncState = "idle";
     syncSpin(false);
-    renderTimeline();
-    if (S.tab === "search") renderSearch();
+    // 자동 반영으로 "전사 대기"가 실제 기록이 되면 조용하지 않게 한 번만 알린다
+    if (auto && changed) {
+      const filled = S.records.filter((r) => r.fileId && r.status !== "pending" && beforePending.has(r.base));
+      if (filled.length) toast(`전사 완료 · ${filled[0].title}`, 2600);
+    }
     if (manual) toast(`동기화 완료 · 기록 ${S.records.length}건`);
   } catch (e) {
     S.syncState = "idle";
@@ -1334,9 +1368,11 @@ async function syncNow({ manual = false } = {}) {
     if (e instanceof AuthError) {
       // 토큰이 만료된 것이지 로그아웃된 것이 아니다. 첫 화면으로 돌아가지 않는다.
       if (e.code === "needs_reconnect") showConnBar(e.code);
-      else toast(e.message);
-    } else {
+      else if (!auto) toast(e.message);
+    } else if (!auto) {
       toast("동기화 실패: " + (e.message || "알 수 없는 오류"));
+    } else {
+      console.warn("auto sync failed", e);      // 자동 동기화는 조용히 다음 회차에 다시 시도한다
     }
     if (!S.records.length) renderTimeline();
   }

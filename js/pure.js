@@ -237,3 +237,56 @@ export function recordSegmentLabel(rec) {
   }
   return "";
 }
+
+/* ── 자동 동기화 (v1.6) ────────────────────────────────────────────────
+   맥 파이프라인이 상주 감시(15초)로 _inbox 를 전사·요약하기 때문에,
+   앱이 가만히 있어도 "전사 대기" 항목이 곧 채워진다. 화면을 다시 열었을 때와
+   타임라인을 보고 있는 동안 드라이브 변경분을 다시 읽어 자동으로 반영한다.
+   (녹음 중·화면 가려짐·동기화 중에는 건드리지 않는다) */
+export const AUTO_SYNC_MS = 30000;          // 타임라인을 보고 있을 때 확인 주기
+export const AUTO_SYNC_PENDING_MS = 20000;  // 전사·요약 대기 항목이 있을 때
+export const AUTO_SYNC_TICK_MS = 5000;      // 위 조건을 판단하는 주기
+export const AUTO_SYNC_FORCE_GAP_MS = 8000; // 복귀 직후 즉시 동기화의 최소 간격
+
+/* 아직 전사 JSON 이 없는(전사 대기) 기록 수 */
+export function awaitingTranscription(records = []) {
+  return (records || []).filter((r) => r && (r.status === "pending")).length;
+}
+
+/* 전사는 됐지만 요약·제목이 비어 있는 기록 수 (Gemini 장애로 전사만 저장된 경우) */
+export function missingSummary(records = []) {
+  return (records || []).filter((r) => {
+    if (!r || r.status === "pending") return false;
+    const s = r.summary || {};
+    const one = String(s.one_line || "").trim();
+    return !one;
+  }).length;
+}
+
+/* 지금 확인해야 하는 주기(ms) — 대기 중인 작업이 있으면 더 자주 */
+export function autoSyncInterval(records = []) {
+  return (awaitingTranscription(records) || missingSummary(records)) ? AUTO_SYNC_PENDING_MS : AUTO_SYNC_MS;
+}
+
+/* 지금 드라이브를 다시 읽어도 되는가 */
+export function autoSyncDue({
+  now = 0, lastSync = 0, syncState = "idle", mode = "", visibility = "visible",
+  recording = false, records = [], force = false, intervalMs = null,
+} = {}) {
+  if (mode !== "live") return false;
+  if (visibility !== "visible") return false;
+  if (syncState === "syncing") return false;
+  if (recording) return false;
+  const gap = now - (lastSync || 0);
+  if (force) return gap >= AUTO_SYNC_FORCE_GAP_MS;
+  const iv = intervalMs == null ? autoSyncInterval(records) : intervalMs;
+  return gap >= iv;
+}
+
+/* 기록 목록이 실제로 바뀌었는지 비교하는 지문 — 같으면 다시 그리지 않는다 */
+export function recordSignature(records = []) {
+  return (records || [])
+    .map((r) => `${r.id || r.base || ""}|${r.modifiedTime || ""}|${r.status || ""}`)
+    .sort()
+    .join(",");
+}

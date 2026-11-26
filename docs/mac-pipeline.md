@@ -180,3 +180,35 @@ tail -f ~/Library/Logs/hemory-pipeline.log
 - 한국어 TTS 샘플(13초)을 `_inbox` 에 올려 전 구간 확인: `inbox 오디오 1개` → whisper 전사 4문장 → `Hemory-개인녹음/2026-11/*.json` 저장(`schema: hemory.transcript.v1`) → 오디오를 월 폴더로 이동 → 앱에서 동기화해 표시·재생 확인.
 - 정리 경로: `retention_days` 를 잠시 0으로 두고 실행 → 월 폴더의 오디오+JSON 이 정리되고(드라이브 백엔드는 휴지통) 원래 365로 복구.
 - launchd 경로: `launchctl start com.hemory.pipeline` → 전사·정리 둘 다 exit 0, 로그 정상.
+
+## 상주 감시(준실시간) 모드 — v1.6 (2026-11-26)
+
+30분 원샷(`--once`)은 매번 파이썬을 새로 띄우고 whisper 모델을 다시 메모리에 올린다(3~10초).
+v1.6 은 **데몬 하나가 계속 살아 있으면서 15초마다 `_inbox` 를 훑는** `--watch` 모드를 쓴다.
+
+```zsh
+# 직접 실행(디버그)
+cd ~/hemory-pipeline
+./.venv/bin/python hemory_pipeline.py --watch --interval 15 --config ~/.config/hemory/config.json
+
+# launchd 상주 데몬으로 등록(KeepAlive)
+cp pipeline/com.hemory.pipeline.plist ~/Library/LaunchAgents/
+launchctl bootout gui/$(id -u)/com.hemory.pipeline 2>/dev/null
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hemory.pipeline.plist
+launchctl print gui/$(id -u)/com.hemory.pipeline | grep -E "state|pid"
+```
+
+- `run-hemory.sh` 는 `HEMORY_WATCH=1` 이면 `--watch` 로, 아니면 예전처럼 `--once` + prune 으로 돈다.
+- 상주 모드에서 365일 정리(prune)는 **감시 프로세스가 1시간마다** 스스로 실행한다(`PRUNE_INTERVAL_SEC`).
+- **새 파일 대기 시간**: 예전 `GROWING_SKIP_SEC=90`(업로드 중인 파일을 집지 않으려고)이 90초 지연을 만들었다.
+  지금은 10초 + "크기가 지난 폴링과 같아야 처리" 확인으로 바꿔, 올라온 뒤 보통 **15~25초**에 전사가 시작된다.
+- **`_inbox` 고착 정리**: 월 폴더에 같은 이름 JSON 이 이미 있으면 그 오디오는 `_inbox` 에 영구히 남던 버그를 고쳤다.
+  월 폴더에 같은 이름 오디오가 없으면 월 폴더로 옮기고, 이미 있으면 중복 사본이므로 `_trash` 로 보낸다(휴지통 30일 복원).
+- **다시 요약**: Gemini 503/429 로 요약만 실패해 제목이 "11월 26일 기록" 으로 남은 기록은
+  `--resummarize --since YYYY-MM-DD [--diarize]` 로 전사문은 그대로 두고 제목·요약만 다시 만든다.
+- **상태 확인**: `~/.config/hemory/status.json` 에 `watch_pid`·`watch_cycles`·`watch_heartbeat_at`(10분마다)·`watch_processed_total` 이 남는다.
+- **락**: 회차마다 `~/.config/hemory/pipeline.lock` 을 잡았다 놓으므로, 수동 `--once` 나 다른 실행과 겹쳐도 한쪽만 처리한다. 3시간 넘은 락은 죽은 실행으로 보고 지운다.
+- **맥 잠자기**: 잠들면 프로세스도 멈춘다(깨어나면 launchd 가 다시 띄운다 — `KeepAlive`). 잠자기를 막으려면
+  `sudo pmset -a sleep 0` 또는 `caffeinate -s` 를 함께 둔다. (디스플레이는 꺼져도 됨 — `displaysleep 0` 은 취향)
+- **전사 속도가 진짜 병목**: medium/CPU(int8) 실측으로 실시간의 0.5~1배다. 1,100초 회의는 여전히 10~17분 걸린다.
+  체감 준실시간은 `small`/`base` 모델이나 `whisper_device: "mps"`(Apple Silicon, 로그가 2배 이상 빠르다고 권고)로 바꿔야 한다.

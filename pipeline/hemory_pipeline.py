@@ -19,6 +19,8 @@ Hemory 개인용 — 맥 전사·요약 파이프라인
   python3 hemory_pipeline.py --once --dry-run       # 무엇을 할지만 출력
   python3 hemory_pipeline.py --once --engine whisper --limit 3
   python3 hemory_pipeline.py --once --backend local --root ~/Hemory-개인녹음
+  python3 hemory_pipeline.py --watch                # 상주 감시(기본 15초 폴링, 모델 1회 로드)
+  python3 hemory_pipeline.py --resummarize --since 2026-11-26   # 제목·요약이 빈 기록 다시 요약
 
 설정 파일: ~/.config/hemory/config.json (없으면 pipeline/hemory_config.example.json 참고)
 """
@@ -48,7 +50,11 @@ AUDIO_EXT = {".m4a", ".mp3", ".wav", ".aac", ".caf", ".ogg", ".opus", ".webm", "
 STATUS_PATH = STATE_DIR / "status.json"
 LOCK_PATH = STATE_DIR / "pipeline.lock"
 LOCK_STALE_SEC = 3 * 3600          # 이보다 오래된 락은 죽은 실행으로 본다
-GROWING_SKIP_SEC = 90              # 방금 올라온 파일(업로드 중)은 건너뛴다
+GROWING_SKIP_SEC = 10              # 방금 올라온 파일은 이만큼 기다렸다 집는다(업로드 중 잘린 파일 방지)
+GROWING_STABLE_SEC = 4            # 상주 감시에서 크기가 이만큼 지켜봐도 같아야 다 올라온 것으로 본다
+WATCH_INTERVAL_SEC = 15            # 상주 감시 폴링 간격(초)
+WATCH_HEARTBEAT_SEC = 600          # 조용할 때 대기 로그를 남기는 간격(초)
+PRUNE_INTERVAL_SEC = 3600          # 상주 감시 중 365일 정리를 다시 도는 간격(초)
 DEADMAN_SEC = 3 * 3600             # 마지막 성공이 이보다 오래되면 경고
 
 
@@ -268,6 +274,13 @@ class LocalBackend:
         except Exception:
             return None
 
+    def list_json(self, folder: Path) -> list[dict]:
+        out = []
+        for p in sorted(Path(folder).glob("*.json")):
+            if p.is_file():
+                out.append({"name": p.name, "base": p.stem, "path": p})
+        return out
+
 
 class DriveBackend:
     """Google Drive REST (OAuth 설치형 클라이언트, hemory_auth.py 로 1회 동의)."""
@@ -443,6 +456,18 @@ class DriveBackend:
         except Exception:
             return None
 
+    def list_json(self, folder_id: str) -> list[dict]:
+        q = f"'{folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
+        j = self._req("GET", f"{self.API}/files?q={urllib.parse.quote(q)}"
+                             "&fields=files(id,name,modifiedTime)&pageSize=1000")
+        out = []
+        for f in j.get("files", []):
+            name = f["name"]
+            if not name.lower().endswith(".json"):
+                continue
+            out.append({"name": name, "base": name[:-5], "id": f["id"], "folder_id": folder_id})
+        return out
+
 
 def make_backend(cfg: dict):
     if cfg["backend"] == "drive":
@@ -456,6 +481,21 @@ def folder_of(be, name: str):
 
 # ─────────────────────────────────────────── 전사 엔진
 _WHISPER: dict = {}
+
+
+def _whisper_model(cfg: dict):
+    """faster-whisper 모델을 한 번만 로드해 재사용한다(상주 감시에서 재로드 비용 제거)."""
+    _patch_pyav_compat()
+    from faster_whisper import WhisperModel  # type: ignore
+
+    a = cfg["asr"]
+    global _WHISPER
+    key = (a["whisper_model"], a["whisper_device"], a["whisper_compute"])
+    if _WHISPER.get("key") != key:
+        log(f"  · whisper 모델 로드: {a['whisper_model']}")
+        _WHISPER["model"] = WhisperModel(a["whisper_model"], device=a["whisper_device"], compute_type=a["whisper_compute"])
+        _WHISPER["key"] = key
+    return _WHISPER["model"]
 
 
 def _patch_pyav_compat() -> None:
@@ -481,18 +521,11 @@ def _patch_pyav_compat() -> None:
 def transcribe_whisper(path_or_bytes, cfg: dict, name: str = "audio") -> dict:
     _patch_pyav_compat()
     try:
-        from faster_whisper import WhisperModel  # type: ignore
+        model = _whisper_model(cfg)
     except ImportError:
         raise RuntimeError("faster-whisper 가 설치되어 있지 않습니다: pip install faster-whisper")
 
     a = cfg["asr"]
-    global _WHISPER
-    key = (a["whisper_model"], a["whisper_device"], a["whisper_compute"])
-    if _WHISPER.get("key") != key:
-        log(f"  · whisper 모델 로드: {a['whisper_model']}")
-        _WHISPER["model"] = WhisperModel(a["whisper_model"], device=a["whisper_device"], compute_type=a["whisper_compute"])
-        _WHISPER["key"] = key
-    model = _WHISPER["model"]
     vad_cfg = a.get("vad") or {}
     vad_on = bool(vad_cfg.get("enabled", True))
     vad_params = None
@@ -767,11 +800,50 @@ def pick_engine(cfg: dict) -> str:
         return "gemini"
 
 
+def _move_to(be, item: dict, dest) -> str:
+    """로컬/드라이브 공통 이동."""
+    if be.kind == "local":
+        dest = Path(dest)
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / item["name"]
+        if target.exists() and Path(item["path"]) != target:
+            target = dest / f"{Path(item['name']).stem}-{int(time.time())}{Path(item['name']).suffix}"
+        shutil.move(str(item["path"]), str(target))
+        item["path"] = target
+        return str(target)
+    return be.move(item, dest)
+
+
+def _tidy_duplicate(be, item: dict, cfg: dict, month) -> str:
+    """이미 전사 JSON 이 있는 오디오가 `_inbox` 에 남았을 때 정리한다.
+
+    예전 코드는 `has_json` 이면 그냥 return 해서 그 파일이 `_inbox` 에 영구히 고착됐다
+    (12:44·13:14·13:45·14:15 실행 모두 "inbox 오디오 1개 / 완료 0건").
+      · 월 폴더에 같은 이름 오디오가 없으면 → 월 폴더로 옮긴다(제자리 찾기).
+      · 이미 있으면 → 중복 사본이므로 `_trash` 로 보낸다(드라이브 휴지통 30일 복원 가능).
+    """
+    if not item.get("from_inbox"):
+        return ""
+    try:
+        names = {a["name"] for a in be.list_audio(month)}
+        if item["name"] in names:
+            _move_to(be, item, be.folder(cfg.get("trash", "_trash")))
+            return "중복 사본 → 휴지통"
+        _move_to(be, item, month)
+        return "월 폴더로 이동"
+    except Exception as e:
+        return f"정리 실패({e})"
+
+
 def process_one(be, item: dict, cfg: dict, dry: bool = False, force: bool = False) -> str | None:
     name = item["name"]
     started = parse_stamp(item["base"]) or item["created"].astimezone()
     month = be.month_folder(started)
     if be.has_json(month, item["base"]) and not force:
+        if not dry:
+            note = _tidy_duplicate(be, item, cfg, month)
+            if note:
+                log(f"  · 이미 전사된 파일: {name} → {note}")
         return None
 
     if dry:
@@ -857,39 +929,75 @@ def list_month_folders(be) -> list:
     return [(f["id"], f["name"]) for f in j.get("files", []) if pat.match(f["name"])]
 
 
-def _too_fresh(it: dict, sec: int = GROWING_SKIP_SEC) -> bool:
-    """방금 올라와 아직 쓰이고 있을 수 있는 파일인가(업로드 중 집어가면 잘린 파일이 된다)."""
+_SIZE_SEEN: dict[str, tuple[int, float, float]] = {}
+
+
+def _age_sec(it: dict) -> float | None:
+    """드라이브가 알려 준 수정/생성 시각 기준 경과 초."""
     mt = it.get("modifiedTime") or it.get("createdTime")
     if not mt:
-        return False
+        return None
     try:
         t = dt.datetime.fromisoformat(str(mt).replace("Z", "+00:00"))
         if t.tzinfo is None:
             t = t.replace(tzinfo=dt.timezone.utc)
     except Exception:
+        return None
+    return (dt.datetime.now(dt.timezone.utc) - t).total_seconds()
+
+
+def _too_fresh(it: dict, sec: int | None = None, need_stable: bool = False) -> bool:
+    """방금 올라와 아직 쓰이고 있을 수 있는 파일인가(업로드 중 집어가면 잘린 파일이 된다).
+
+    · GROWING_SKIP_SEC(기본 10초) 안에 올라온 파일은 무조건 다음 차례로 미룬다.
+    · need_stable(상주 감시)이면 한 번 더 지켜본다: 이전 폴링에서 본 크기와 같아야 처리한다.
+      (15초 폴링이면 새 파일은 보통 다음 회차에 바로 처리된다)
+    """
+    sec = GROWING_SKIP_SEC if sec is None else sec
+    now = time.time()
+    key = str(it.get("id") or it.get("name") or "")
+    size = int(it.get("size") or 0)
+    prev = _SIZE_SEEN.get(key)
+    # 같은 크기를 계속 보고 있으면 첫 관측 시각을 유지한다(그래야 '얼마나 지켜봤는지'가 된다)
+    if prev and prev[0] == size:
+        first, last = prev[1], now
+    else:
+        first, last = now, now
+    _SIZE_SEEN[key] = (size, first, last)
+    if len(_SIZE_SEEN) > 2000:                     # 오래 본 이름은 버린다(메모리 고정 방지)
+        for k, (_s, _f, t) in list(_SIZE_SEEN.items()):
+            if now - t > 3600:
+                _SIZE_SEEN.pop(k, None)
+    age = _age_sec(it)
+    if age is not None and age < sec:
+        return True
+    if not need_stable:
         return False
-    return (dt.datetime.now(dt.timezone.utc) - t).total_seconds() < sec
+    seen_before = prev is not None and prev[0] == size
+    return not (seen_before and (now - prev[1]) >= GROWING_STABLE_SEC)
 
 
-def scan_inbox(be, cfg: dict) -> list[dict]:
+def scan_inbox(be, cfg: dict, need_stable: bool = False, quiet: bool = False) -> list[dict]:
     inbox = be.folder(cfg["inbox"])
     items = []
     for it in be.list_audio(inbox):
-        if _too_fresh(it):
-            log(f"  · 아직 올라오는 중: {it['name']} (다음 실행에 처리)")
+        if _too_fresh(it, need_stable=need_stable):
+            if not quiet:
+                log(f"  · 아직 올라오는 중: {it['name']} (다음 실행에 처리)")
             continue
         it["from_inbox"] = True
         items.append(it)
     # 월 폴더에 오디오만 있고 JSON 이 없는 경우(업로드 중단·수동 복사)도 복구
     for folder_id, _name in list_month_folders(be):
         for it in be.list_audio(folder_id):
-            if not be.has_json(folder_id, it["base"]) and not _too_fresh(it):
+            if not be.has_json(folder_id, it["base"]) and not _too_fresh(it, need_stable=need_stable):
                 it["from_inbox"] = False
                 items.append(it)
     return items
 
 
-def run_once(cfg: dict, dry: bool = False, limit: int | None = None, force: bool = False) -> int:
+def run_once(cfg: dict, dry: bool = False, limit: int | None = None, force: bool = False,
+             quiet: bool = False, need_stable: bool = False) -> int:
     global _CFG_REF
     _CFG_REF = cfg
     ensure_dirs(cfg)
@@ -911,15 +1019,18 @@ def run_once(cfg: dict, dry: bool = False, limit: int | None = None, force: bool
 
     fd = acquire_lock()
     if fd is None and not dry:
-        log("이미 실행 중인 파이프라인이 있어 건너뜁니다(락 파일)")
+        if not quiet:
+            log("이미 실행 중인 파이프라인이 있어 건너뜁니다(락 파일)")
         return 0
     try:
         be = make_backend(cfg)
         where = be.root if be.kind == "local" else f"{cfg['root_name']} (drive)"
-        log(f"백엔드={be.kind} 루트={where}")
+        if not quiet:
+            log(f"백엔드={be.kind} 루트={where}")
 
-        items = scan_inbox(be, cfg)
-        log(f"inbox 오디오 {len(items)}개")
+        items = scan_inbox(be, cfg, need_stable=need_stable, quiet=quiet)
+        if not quiet:
+            log(f"inbox 오디오 {len(items)}개")
         if limit:
             items = items[:limit]
         done = 0
@@ -931,7 +1042,8 @@ def run_once(cfg: dict, dry: bool = False, limit: int | None = None, force: bool
                 raise
             except Exception as e:
                 log(f"  ! 실패 {it['name']}: {e}")
-        log(f"완료 {done}건")
+        if not quiet or done:
+            log(f"완료 {done}건")
         if not dry:
             write_status(
                 ok=True,
@@ -966,6 +1078,221 @@ def run_once(cfg: dict, dry: bool = False, limit: int | None = None, force: bool
         release_lock(fd)
 
 
+# ─────────────────────────────── 다시 요약 / 상주 감시 (v1.6)
+def needs_summary(rec: dict) -> bool:
+    """요약·제목이 비었거나 기본 제목으로 남은 기록인가.
+
+    Gemini 503/429 때 전사만 저장되면 제목이 "11월 26일 기록" 으로 남는다.
+    """
+    s = rec.get("summary") or {}
+    if not str(s.get("one_line") or "").strip():
+        return True
+    t = str(rec.get("title") or "").strip()
+    if not t:
+        return True
+    return bool(re.match(r"^\d{1,2}월\s*\d{1,2}일 기록$", t))
+
+
+def _month_pairs(be) -> list[tuple]:
+    """(폴더 참조, 폴더 이름) — 로컬은 Path, 드라이브는 폴더 id."""
+    if be.kind == "local":
+        return [(p, p.name) for p in list_month_folders(be)]
+    return list(list_month_folders(be))
+
+
+def _read_json_item(be, folder, item: dict) -> dict | None:
+    try:
+        if be.kind == "local":
+            return json.loads(Path(item["path"]).read_text(encoding="utf-8"))
+        return json.loads(be.read_bytes(item))
+    except Exception as e:
+        log(f"  ! JSON 읽기 실패 {item['name']}: {e}")
+        return None
+
+
+def resummarize(be, cfg: dict, since: dt.date | None = None, until: dt.date | None = None,
+                dry: bool = False, limit: int | None = None, diarize_again: bool = False) -> int:
+    """전사는 됐지만 요약·제목이 빈 기록을 다시 요약해 같은 JSON 을 갱신한다."""
+    global _CFG_REF
+    _CFG_REF = cfg
+    done = 0
+    for folder, mname in _month_pairs(be):
+        try:
+            ym = (int(mname[:4]), int(mname[5:7]))
+        except Exception:
+            continue
+        if since and ym < (since.year, since.month):
+            continue
+        if until and ym > (until.year, until.month):
+            continue
+        for item in be.list_json(folder):
+            base = item["base"]
+            day = None
+            mm = re.match(r"^(\d{4})(\d{2})(\d{2})", base)
+            if mm:
+                try:
+                    day = dt.date(int(mm.group(1)), int(mm.group(2)), int(mm.group(3)))
+                except Exception:
+                    day = None
+            if since and day and day < since:
+                continue
+            if until and day and day > until:
+                continue
+            rec = _read_json_item(be, folder, item)
+            if not rec or not needs_summary(rec):
+                continue
+            segs = rec.get("segments") or []
+            if not segs:
+                log(f"  · 문장이 없어 건너뜀: {item['name']}")
+                continue
+            if dry:
+                log(f"  [dry] 다시 요약: {item['name']} (문장 {len(segs)}개)")
+                continue
+            log(f"  · 다시 요약: {item['name']} (문장 {len(segs)}개)")
+            diar = (rec.get("engine") or {}).get("diarization", "none")
+            work = [dict(s) for s in segs]
+            if diarize_again and not any(s.get("speaker") for s in work):
+                try:
+                    audio = next((a for a in be.list_audio(folder) if a["base"] == base), None)
+                    data = be.read_bytes(audio) if audio else b""
+                    work, diar = diarize(work, data, audio or {"name": item["name"]}, cfg)
+                    log(f"  · 화자: {diar}")
+                except Exception as e:
+                    log(f"  · 화자 추정 생략: {e}")
+            try:
+                summary = summarize(work, cfg, hint=f"파일 이름: {item['name']}")
+            except Exception as e:
+                log(f"  ! 요약 실패 {item['name']}: {e}")
+                continue
+            if not str(summary.get("one_line") or "").strip():
+                log(f"  ! 요약이 비어 있음(모델 응답 없음): {item['name']}")
+                continue
+            rec["title"] = summary.get("title") or rec.get("title") or f"{base[:8]} 기록"
+            if summary.get("type") in TYPES:
+                rec["type"] = summary["type"]
+            rec["summary"] = {
+                "one_line": summary.get("one_line", ""),
+                "bullets": summary.get("bullets") or [],
+                "agenda": summary.get("agenda") or [],
+                "decisions": summary.get("decisions") or [],
+                "actions": summary.get("actions") or [],
+                "keywords": summary.get("keywords") or [],
+            }
+            if diarize_again:
+                rec["segments"] = [{"i": s.get("i", i), "start": s.get("start"), "end": s.get("end"),
+                                    "speaker": s.get("speaker", ""), "text": s.get("text", "")}
+                                   for i, s in enumerate(work)]
+                rec["speakers"] = sorted({s.get("speaker") for s in work if s.get("speaker")})
+                rec.setdefault("engine", {})["diarization"] = diar
+            rec.setdefault("engine", {})["summary"] = cfg_model()
+            rec["resummarized_at"] = now_local().isoformat(timespec="seconds")
+            try:
+                be.write_json(folder, item["name"], rec)
+            except Exception as e:
+                log(f"  ! 저장 실패 {item['name']}: {e}")
+                continue
+            log(f"  · 갱신: {rec['title']} [{rec.get('type')}] · {rec['summary']['one_line'][:60]}")
+            done += 1
+            if limit and done >= limit:
+                return done
+    return done
+
+
+_STOP = {"flag": False}
+
+
+def _install_stop_handlers() -> None:
+    import signal as _sig
+
+    def _handler(signum, _frame):
+        _STOP["flag"] = True
+        log(f"종료 신호({signum}) — 이번 회차를 마치고 멈춥니다")
+
+    for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+        sig = getattr(_sig, name, None)
+        if sig is None:
+            continue
+        try:
+            _sig.signal(sig, _handler)
+        except Exception:
+            pass
+
+
+def _sleep_until_stop(sec: float) -> None:
+    end = time.time() + sec
+    while not _STOP["flag"] and time.time() < end:
+        time.sleep(max(0.05, min(0.5, end - time.time())))
+
+
+def _run_prune(config_path: Path | None) -> None:
+    prune = Path(__file__).with_name("hemory_prune.py")
+    if not prune.exists():
+        return
+    cmd = [sys.executable, str(prune), "--purge"]
+    if config_path:
+        cmd += ["--config", str(config_path)]
+    log("· 365일 정리(prune) 실행")
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+        for line in (r.stdout or "").strip().splitlines()[-3:]:
+            log("  " + line)
+        if r.returncode != 0:
+            log(f"  ! prune 실패({r.returncode}): {(r.stderr or '').strip()[:200]}")
+    except Exception as e:
+        log(f"  ! prune 실행 실패: {e}")
+
+
+def watch(cfg: dict, interval: int = WATCH_INTERVAL_SEC, dry: bool = False, limit: int | None = None,
+          force: bool = False, config_path: Path | None = None) -> None:
+    """상주 감시(준실시간). 모델을 시작할 때 한 번만 올리고 interval 초마다 _inbox 를 훑는다."""
+    global _CFG_REF
+    _CFG_REF = cfg
+    _install_stop_handlers()
+    log(f"상주 감시 시작 · {interval}초 간격 · 엔진={pick_engine(cfg)} · pid={os.getpid()}")
+    if pick_engine(cfg) == "whisper":
+        try:
+            _whisper_model(cfg)
+            log("  · whisper 준비 완료(이후 회차는 재로드 없음)")
+        except Exception as e:
+            log(f"! whisper 모델 로드 실패: {e}")
+    write_status(watch_pid=os.getpid(),
+                 watch_started_at=now_local().isoformat(timespec="seconds"),
+                 watch_interval_sec=interval)
+    last_beat = 0.0
+    last_prune = 0.0
+    cycles = 0
+    total_done = 0
+    while not _STOP["flag"]:
+        t0 = time.time()
+        n = 0
+        try:
+            n = run_once(cfg, dry=dry, limit=limit, force=force, quiet=True, need_stable=True)
+            total_done += n
+        except AuthError as e:
+            log(f"! 인증 실패 — 감시는 유지: {e}")
+        except Exception as e:
+            log(f"! 감시 중 오류: {e}")
+        cycles += 1
+        now = time.time()
+        if n:
+            write_status(watch_pid=os.getpid(), watch_cycles=cycles,
+                         watch_processed_total=total_done,
+                         watch_last_work_at=now_local().isoformat(timespec="seconds"))
+        if now - last_beat >= WATCH_HEARTBEAT_SEC:
+            write_status(watch_pid=os.getpid(), watch_cycles=cycles,
+                         watch_heartbeat_at=now_local().isoformat(timespec="seconds"),
+                         watch_processed_total=total_done)
+            st = read_status()
+            log(f"대기 중 · {cycles}회 확인 · 누적 처리 {total_done}건 · 마지막 성공 {st.get('last_success_at', '-')}")
+            last_beat = now
+        if now - last_prune >= PRUNE_INTERVAL_SEC:
+            _run_prune(config_path)
+            last_prune = time.time()
+        _sleep_until_stop(max(1.0, interval - (time.time() - t0)))
+    log(f"상주 감시 종료 · {cycles}회 확인 · 누적 처리 {total_done}건")
+    write_status(watch_pid=0, watch_stopped_at=now_local().isoformat(timespec="seconds"))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Hemory 개인용 전사·요약 파이프라인")
     ap.add_argument("--once", action="store_true", help="한 번만 실행 (기본)")
@@ -978,6 +1305,12 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--force", action="store_true", help="JSON 이 있어도 다시 처리")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--watch", action="store_true", help="상주 감시 — 15초마다 _inbox 를 훑는다(모델 1회 로드)")
+    ap.add_argument("--interval", type=int, default=WATCH_INTERVAL_SEC, help="상주 감시 폴링 간격(초)")
+    ap.add_argument("--resummarize", action="store_true", help="요약·제목이 빈 기록을 다시 요약")
+    ap.add_argument("--since", default=None, help="다시 요약 대상 시작일 YYYY-MM-DD")
+    ap.add_argument("--until", default=None, help="다시 요약 대상 종료일 YYYY-MM-DD")
+    ap.add_argument("--diarize", action="store_true", help="다시 요약할 때 화자도 다시 추정")
     ap.add_argument("--self-test", action="store_true", help="엔진 없이 파이프라인 로직만 검사")
     args = ap.parse_args()
 
@@ -993,6 +1326,20 @@ def main() -> None:
 
     if args.self_test:
         self_test(cfg)
+        return
+
+    if args.resummarize:
+        be = make_backend(cfg)
+        since = dt.date.fromisoformat(args.since) if args.since else None
+        until = dt.date.fromisoformat(args.until) if args.until else None
+        n = resummarize(be, cfg, since=since, until=until, dry=args.dry_run,
+                        limit=args.limit, diarize_again=args.diarize)
+        log(f"다시 요약 완료 {n}건")
+        return
+
+    if args.watch:
+        watch(cfg, interval=args.interval, dry=args.dry_run, limit=args.limit,
+              force=args.force, config_path=args.config)
         return
 
     run_once(cfg, dry=args.dry_run, limit=args.limit, force=args.force)
