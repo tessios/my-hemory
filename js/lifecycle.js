@@ -55,3 +55,66 @@ export function sensorQuietLabel({ perm, listening, hasSignal, quietMs = 0, arme
   if (!hasSignal && quietMs >= SENSOR_QUIET_MS && (armed || listening)) return "탭해서 센서 재개";
   return "";
 }
+
+/* ── v1.7: 사용자 터치 없이 마이크를 다시 잡아도 되는가 ─────────────────
+   iOS 는 getUserMedia 에 제스처를 요구하지 않는다(WebKit). 다만 처음 권한을 묻는
+   순간에는 사용자 동작이 있는 편이 좋고, 이미 허용된 사이트면 프롬프트 없이 열린다.
+   그래서 '권한이 granted' 이거나 '이 대여(이번 실행)에서 이미 열어 둔 트랙'일 때만
+   조용히 시도하고, 아직 prompt 인데 한 번도 허용한 적이 없으면 첫 탭을 기다린다.
+   (Claude 검토 반영 — micAllowed 플래그는 안내 문구 선택에만 쓰고 판정에는 쓰지 않는다) */
+export function autoMicPlan({ permission = "unknown", held = false, live = false, everAllowed = false, busy = false } = {}) {
+  if (busy) return { action: "skip", reason: "busy" };
+  if (live) return { action: "keep", reason: "live" };                 // 살아 있음 → 아무 것도 하지 않는다
+  if (permission === "denied") return { action: "denied", reason: "permission-denied" };
+  if (permission === "granted") return { action: held ? "reopen" : "open", reason: "permission-granted" };
+  if (held) return { action: "reopen", reason: "lease-lost" };          // 이번 실행에서 허용받은 대여가 끊김
+  if (permission === "prompt") return { action: "gesture", reason: "permission-prompt" };
+  if (everAllowed) return { action: "open", reason: "previously-allowed" }; // unknown(미지원) + 예전 허용
+  return { action: "gesture", reason: "never-allowed" };
+}
+
+/* 마이크가 열리지 않았을 때 화면에 남길 한 줄 — 진짜 막힌 경우에만 안내한다 */
+export function micGuide({ reason = "", permission = "unknown", everAllowed = false } = {}) {
+  const r = String(reason || "");
+  if (r === "NotReadableError" || r === "TrackStartError" || r === "AbortError") return "다른 앱이 마이크를 쓰고 있습니다";
+  if (permission === "denied" || r === "denied" || r === "permission-denied") return "설정 > 앱 > 마이크에서 허용해 주세요";
+  if (everAllowed) return "화면을 한 번 탭하면 마이크를 연결합니다";
+  return "";
+}
+
+/* ── v1.7: 대기 중 마이크 레벨 표시의 상태 판정 ────────────────────────
+   핵심은 '0 을 무음으로 오탐하지 않는 것'이다. AudioContext 가 잠들어 있으면
+   analyser 는 0 만 돌려주는데, 그것을 '무음'이라고 적으면 마이크가 죽은 것처럼 보인다.
+     none       대여 없음            → '마이크 없음(탭)'
+     lost       트랙 종료            → '끊김'
+     interrupted 트랙 muted           → '중단됨'
+     waiting    컨텍스트가 running 이 아님 → '측정 대기 · 탭하면 확인' (0 을 믿지 않는다)
+     nosignal   1초 넘게 정확히 0     → '신호 없음' (그래프·트랙 이상)
+     silent     바닥 잡음 수준이 3초  → '무음' (조용한 방, 정상)
+     live       그 외                → 레벨 막대 */
+export function meterVerdict({ hasStream = false, ended = false, muted = false, ctxRunning = false, rms = null, zeroMs = 0, quietMs = 0, floor = 0 } = {}) {
+  if (!hasStream) return "none";
+  if (ended) return "lost";
+  if (muted) return "interrupted";
+  if (!ctxRunning || rms == null) return "waiting";
+  if (rms === 0 && zeroMs >= 1000) return "nosignal";
+  if (rms > 0 && rms <= Math.max(0.004, floor * 2) && quietMs >= 3000) return "silent";
+  return "live";
+}
+
+/* ── v1.7: 업로드 재전송 큐 ───────────────────────────────────────────
+   오프라인·토큰 만료로 드라이브 업로드가 실패한 녹음은 IndexedDB 에 남는다.
+   그 큐를 언제 다시 보낼지: 온라인·화면이 보일 때, 실패할수록 간격을 늘린다(최대 10분). */
+export const QUEUE_BASE_MS = 30000;
+export const QUEUE_MAX_MS = 10 * 60 * 1000;
+
+export function queueBackoff(fails = 0, base = QUEUE_BASE_MS, max = QUEUE_MAX_MS) {
+  const n = Math.max(0, Math.min(8, Math.round(Number(fails) || 0)));
+  return Math.min(max, base * 2 ** n);
+}
+
+export function queueDue({ now = 0, lastTry = 0, fails = 0, count = 0, online = true, visible = true } = {}) {
+  if (count <= 0) return false;
+  if (!online || !visible) return false;
+  return now - (lastTry || 0) >= queueBackoff(fails);
+}

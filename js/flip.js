@@ -218,6 +218,16 @@ export class FlipWatcher {
     this._sync();
   }
 
+  /* v1.7 — 마이크가 다시 연결됐다. 녹음 시작 실패 때문에 '들었다 다시 엎어야' 하던 막힘을
+     풀어, 이미 엎어 둔 채로도 다음 판정(1.5초 유지)에서 바로 시작되게 한다. */
+  unblock() {
+    if (!this.blockUntilRelease) return false;
+    this.blockUntilRelease = false;
+    this.downSince = 0;
+    this._sync();
+    return true;
+  }
+
   _absorbMotion(e) {
     const a = e.accelerationIncludingGravity || e.acceleration;
     if (a && typeof a.z === "number" && Number.isFinite(a.z)) {

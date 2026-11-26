@@ -119,6 +119,13 @@ input,textarea{font:inherit;color:inherit}
 .dn-month svg{color:var(--muted);margin-top:2px}
 .dn-today{font-size:12.5px;color:var(--ink-2);padding:6px 2px;font-weight:600}
 .dn-today.on{color:var(--acc)}
+.dn-right{display:inline-flex;align-items:center;gap:10px}
+/* v1.7 — 업로드 대기 배지(탭하면 지금 올리기) */
+.qdot{display:inline-flex;align-items:center;gap:5px;height:24px;padding:0 9px;border-radius:999px;background:rgba(201,239,92,.1);border:1px solid rgba(201,239,92,.32);color:var(--acc);font-size:11px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:0}
+.qdot[hidden]{display:none}
+.qdot .qd-dot{width:6px;height:6px;border-radius:50%;background:var(--acc);animation:sopulse 1.8s infinite}
+.qdot[data-fails="1"]{background:rgba(255,99,99,.1);border-color:rgba(255,99,99,.34);color:var(--danger)}
+.qdot[data-fails="1"] .qd-dot{background:var(--danger);animation:none}
 
 /* 주간 캘린더 */
 .weekstrip{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;padding:4px 10px 10px}
@@ -438,6 +445,14 @@ input,textarea{font:inherit;color:inherit}
 .flip-chip[data-state="need-tap"] .fc-dot{background:var(--acc-2);box-shadow:0 0 0 3px rgba(201,239,92,.16)}
 .flip-chip[data-state="denied"] .fc-dot,.flip-chip[data-state="nosignal"] .fc-dot{background:var(--danger)}
 .flip-chip:active{transform:translateX(-50%) scale(.99)}
+/* v1.7 — 뒤집어 녹음 칩 안의 마이크 레벨 미터(대기 중에도 마이크가 살아 있는지 확인) */
+.fc-meter{display:inline-flex;align-items:flex-end;gap:2px;height:12px;margin-left:3px;flex:0 0 auto}
+.fc-meter[hidden]{display:none}
+.fc-meter i{width:3px;height:4px;border-radius:2px;background:rgba(255,255,255,.18);transition:height .12s ease,background .12s ease}
+.fc-meter i.on{background:var(--acc);height:11px}
+.fc-meter[data-s="waiting"] i,.fc-meter[data-s="silent"] i{background:rgba(255,255,255,.16);height:3px}
+.fc-meter[data-s="nosignal"] i,.fc-meter[data-s="lost"] i{background:rgba(255,99,99,.55);height:5px}
+.fc-meter[data-s="interrupted"] i{background:rgba(201,239,92,.4);height:4px}
 
 /* 뒤집어 녹음 — 설정의 센서 실시간 표시 */
 .flip-test{margin:10px 0 2px;border:1px solid var(--line);border-radius:14px;overflow:hidden;background:var(--surface)}

@@ -4,7 +4,7 @@ import { drive, AuthError } from "./drive.js";
 import { store } from "./store.js";
 import { buildIndex, search as doSearch, evidence, keywords, highlight } from "./search.js";
 import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./qa.js";
-import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground, micPermissionState } from "./record.js";
+import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground, micPermissionState, micEverAllowed, micMeterRead } from "./record.js";
 import { FlipWatcher } from "./flip.js";
 import { flipBootPlan, resumePlan, RESUME_GAP_MS } from "./flow.js";
 import {
@@ -13,7 +13,7 @@ import {
   autoSyncDue, recordSignature, AUTO_SYNC_TICK_MS,
   scheduleSlotOf, mutedAutoSlot, nextAutoAction,
 } from "./pure.js";
-import { sensorResumePlan, sensorQuietLabel, SENSOR_QUIET_MS } from "./lifecycle.js";
+import { sensorResumePlan, sensorQuietLabel, SENSOR_QUIET_MS, autoMicPlan, micGuide, queueDue } from "./lifecycle.js";
 import {
   $, $$, esc, fmtClock, fmtDuration, fmtDay, fmtTime, dayKey, fmtMoment,
   toast, haptic, debounce, uid, stamp, localSettings, saveSettings,
@@ -38,7 +38,8 @@ const S = {
   sel: { on: false, ids: new Set() },          // 타임라인 선택 모드
   seg: { index: 0, startAt: 0, timer: null, type: "work", rotating: null },  // 30분 세그먼트
   segSession: null,                            // 로컬 적립 중인 녹음 세션 메타
-  mic: { warn: false, denied: false, nextTry: 0, armed: false, resumeAt: 0 },   // 마이크 연결 유지 감시
+  mic: { warn: false, denied: false, nextTry: 0, armed: false, resumeAt: 0, guideShown: false, trying: false },   // 마이크 연결 유지 감시
+  queue: { count: 0, fails: 0, lastTry: 0, busy: false },   // 드라이브 업로드 재전송 큐
   week: [],                                    // 현재 주간 바
   resume: { armed: false, kind: "", type: "work", at: 0 },   // 앱을 나갔다 돌아와 이어서 녹음할 대기
   res: { on: false, type: "work", startedAt: 0, title: "" },  // 이어서 녹음(세션 연결) 중
@@ -181,7 +182,14 @@ function restoreFaceDown() {
   } else if (plan.ask === "none" && plan.arm && !flip.granted && flip.perm !== "denied") {
     armFlipPermission();
   }
-  if (plan.warmMic) armMicGesture();              // 첫 탭에서 마이크도 함께 연다
+  if (plan.warmMic) {
+    // v1.7: 앱을 처음 열었을 때도 조용히 한 번 시도한다 — 권한이 남아 있으면 탭 없이 연결된다.
+    //   (안 되면 첫 탭에서 열도록 armMicGesture 가 대기한다)
+    armMicGesture();
+    setTimeout(() => {
+      if (S.mode === "live" && faceDownPref() && !micStatus().live) silentMicReconnect("boot");
+    }, 600);
+  }
   renderFlipChip();
 }
 
@@ -190,6 +198,67 @@ function restoreFaceDown() {
    엎기에서도 사용자 터치 없이 바로 녹음이 시작된다(iOS 는 캡처가 끊기면 권한을 푼다).
    iOS 가 전화·화면 잠금·백그라운드로 트랙을 끊으면 조용히 다시 열어 보고, 그것도 막히면
    '탭해서 마이크 연결'로 알리고 다음 터치에서 다시 연다. */
+/* ── 마이크 자동 재연결 (v1.7) ─────────────────────────────
+   사용자 요청: "나갔다가 들어와도 마이크 access 안 눌러도 자동으로 켜지게".
+   iOS WebKit 은 getUserMedia 에 제스처를 요구하지 않는다 — 막는 것은 '아직 허용하지
+   않은 사이트의 권한 창'이다. 그래서 아래 경우에만 조용히 다시 잡는다.
+     · 권한이 이미 granted (permissions.query)
+     · 이번 실행에서 열어 둔 대여가 끊김 → 같은 권한으로 재개
+     · 한 번이라도 허용한 적이 있고 권한 상태를 알 수 없음(unknown)
+   아직 prompt 이고 허용한 적이 없다면 맥락 없이 권한 창을 띄우지 않고 첫 탭을 기다린다.
+   (Claude 검토 반영 — pointerdown 은 사용자 제스처로 인정되지 않으므로 실제 획득은
+    pointerup·touchend·click 에서 하고, pointerdown 에서는 조용한 시도만 한다) */
+async function silentMicReconnect(why = "resume") {
+  if (S.mic.trying) return { ok: false, action: "skip" };
+  S.mic.trying = true;
+  try { return await silentMicReconnectInner(why); }
+  finally { S.mic.trying = false; }
+}
+
+async function silentMicReconnectInner(why = "resume") {
+  if (S.mode !== "live") return { ok: false, action: "none" };
+  if (recordingNow()) return { ok: true, action: "keep" };
+  const st = micStatus();
+  if (st.live) {
+    if (S.mic.warn || S.mic.denied) { S.mic.warn = false; S.mic.denied = false; renderFlipChip(); }
+    return { ok: true, action: "keep" };
+  }
+  const permission = await micPermissionState();
+  const plan = autoMicPlan({
+    permission, held: st.held, live: st.live,
+    everAllowed: micEverAllowed(), busy: !recorderIdle(),
+  });
+  if (plan.action === "keep") return { ok: true, action: "keep" };
+  if (plan.action === "skip") return { ok: false, action: "skip" };
+  if (plan.action === "denied") {
+    S.mic.denied = true; S.mic.warn = false;
+    renderFlipChip();
+    return { ok: false, action: "denied", reason: "permission-denied" };
+  }
+  if (plan.action === "gesture") {
+    S.mic.denied = false; S.mic.warn = false;
+    armMicGesture();
+    renderFlipChip();
+    return { ok: false, action: "gesture", reason: plan.reason };
+  }
+  const r = st.held ? await resumeMicAfterBackground() : await acquireMic();
+  if (r.ok) {
+    const wasWarn = S.mic.warn;
+    S.mic.warn = false; S.mic.denied = false;
+    renderFlipChip(); paintMicMeter();
+    if (wasWarn) toast("마이크를 다시 연결했습니다 · 폰을 엎으면 바로 녹음됩니다", 2200);
+    return { ok: true, action: plan.action };
+  }
+  const denied = r.reason === "denied" || S.mic.denied;
+  S.mic.denied = denied;
+  S.mic.warn = !denied;
+  const guide = micGuide({ reason: r.reason || r.error, permission, everAllowed: micEverAllowed() });
+  if (guide && !S.mic.guideShown) { S.mic.guideShown = true; toast(guide, 4200); }
+  if (!denied) armMicGesture();
+  renderFlipChip();
+  return { ok: false, action: "failed", reason: r.reason || "error" };
+}
+
 async function ensureMicStandby({ gesture = false, tryAnyway = false } = {}) {
   if (S.mode !== "live") return false;
   if (S.recorder.state === "recording" || S.recorder.state === "paused") return true;
@@ -198,30 +267,23 @@ async function ensureMicStandby({ gesture = false, tryAnyway = false } = {}) {
     if (S.mic.warn || S.mic.denied) { S.mic.warn = false; S.mic.denied = false; renderFlipChip(); }
     return true;
   }
-  // 이번 실행에서 아직 허용 전(idle)이거나 차단됨이면, 제스처 없이 iOS 에 권한 질문을 던지지 않는다.
-  //   → '탭해서 마이크 연결'로 알리고 다음 터치에서 연다.
-  //   이번 실행에서 열었던 트랙이 끊긴 것(interrupted·lost)이면 권한은 살아 있으니 조용히 다시 잡아 본다.
-  const recoverable = st.state === "interrupted" || st.state === "lost";
-  if (!gesture && !recoverable && !tryAnyway) {
-    S.mic.denied = st.state === "denied";
-    armMicGesture();
+  // 제스처 안이면 곧바로 연다(권한 창도 이 안에서). 아니면 위의 자동 재연결 판단을 따른다.
+  if (gesture || tryAnyway) {
+    const r = await acquireMic();
+    if (r.ok) {
+      if (S.mic.warn) toast("마이크를 다시 연결했습니다 · 폰을 엎으면 바로 녹음됩니다", 2400);
+      S.mic.warn = false; S.mic.denied = false;
+      renderFlipChip(); paintMicMeter();
+      return true;
+    }
+    S.mic.warn = true;
+    S.mic.denied = r.reason === "denied";
+    const guide = micGuide({ reason: r.reason || r.error, permission: "unknown", everAllowed: micEverAllowed() });
+    if (S.mic.denied && guide && !S.mic.guideShown) { S.mic.guideShown = true; toast(guide, 4200); }
     renderFlipChip();
     return false;
   }
-  const r = await acquireMic();
-  if (r.ok) {
-    if (S.mic.warn) {
-      toast("마이크를 다시 연결했습니다 · 폰을 엎으면 바로 녹음됩니다", 2400);
-    }
-    S.mic.warn = false; S.mic.denied = false;
-    renderFlipChip();
-    return true;
-  }
-  S.mic.warn = true;
-  S.mic.denied = r.reason === "denied";
-  if (!gesture) armMicGesture();
-  renderFlipChip();
-  return false;
+  return (await silentMicReconnect("standby")).ok;
 }
 
 /* 마지막 녹음 시작 시각 — 상단 바의 '마지막 시작 ...' */
@@ -249,14 +311,28 @@ async function waitForRescue(ms = 4000) {
   while (_rescueBusy && Date.now() - t0 < ms) await new Promise((r) => setTimeout(r, 100));
 }
 
+/* 복귀 처리는 한 번에 하나만 — visibilitychange·pageshow·focus 가 겹쳐 와도
+   350ms 동안 하나로 모은다(오디오 세션이 다시 살아날 시간도 준다, Claude 검토 반영). */
+let _resumeTimer = null;
+function scheduleResume(delay = 350) {
+  if (S.mode !== "live") return;
+  clearTimeout(_resumeTimer);
+  _resumeTimer = setTimeout(() => { _resumeTimer = null; resumeAfterBackground(); }, delay);
+}
+
 async function resumeAfterBackground() {
   if (S.mode !== "live" || _resumeBusy) return;
   _resumeBusy = true;
   try {
     await waitForRescue();
+    if (document.visibilityState === "hidden") return;
+    /* 예약 녹음 판단도 여기서 한 번만 한다 — 예전에는 visibilitychange 가 schedTick 과
+       resumeAfterBackground 를 따로 불러, 예약 녹음과 '이어서 녹음'이 동시에 시작될 수 있었다. */
+    schedTick();
     if (S.recorder.state === "recording" || S.recorder.state === "paused") {
       await resumeRecordingAfterBackground();
       renderFlipChip();
+      refreshQueue();
       return;
     }
 
@@ -271,7 +347,8 @@ async function resumeAfterBackground() {
       const rp = resumePlan({
         armed: true, gapMs: Date.now() - (S.resume.at || 0),
         micLive: st.live, micMuted: st.muted, perm,
-        visible: document.visibilityState === "visible", busy: !recorderIdle(),
+        visible: document.visibilityState === "visible",
+        busy: !recorderIdle() || S.auto.on || S.auto.pending || S.face.active || S.res.on,
       });
       if (rp.action === "expire") {
         S.resume.armed = false;
@@ -305,11 +382,17 @@ async function resumeAfterBackground() {
         if (faceDownPref() && recorderIdle()) armMicGesture();
       }
     } else if (faceDownPref() && recorderIdle()) {
-      armMicGesture();            // 이번 실행에서 아직 연 적이 없다 — 첫 터치에서 연다(프롬프트 억제)
+      /* v1.7: 이번 실행에서 아직 연 적이 없거나 iOS 가 페이지를 새로 만들었다.
+         권한이 남아 있으면 탭 없이 조용히 다시 잡고, 아니면 첫 탭을 기다린다. */
+      const r = await silentMicReconnect("resume");
+      if (!r.ok && r.action === "gesture") armMicGesture();
     }
 
     renderFlipChip();
     paintFlipReadout();
+    paintMicMeter();
+    refreshQueue();                  // 업로드 대기 항목이 남아 있으면 바로 재전송을 시도한다
+    queueTick();
     scheduleSensorQuietCheck();
   } finally { _resumeBusy = false; }
 }
@@ -345,13 +428,23 @@ function scheduleSensorQuietCheck() {
   }, SENSOR_QUIET_MS + 400);
 }
 
-/* 마이크가 끊긴 뒤에는 '다음 터치'에서 사용자 제스처와 함께 다시 연다 */
+/* 마이크가 끊긴 뒤에는 '다음 터치'에서 다시 연다.
+   v1.7: 실제 획득(사용자 제스처)은 pointerup·touchend·click 에서 하고,
+   pointerdown 에서는 제스처 없이 되는 경우(권한 granted)를 조용히 다시 시도한다.
+   그래서 '마이크 access' 버튼을 다시 누르게 하지 않아도 화면 아무 곳이나 한 번
+   만지면 조용히 연결된다. */
 function armMicGesture() {
   if (S.mic.armed) return;
   S.mic.armed = true;
   let busy = false;
   const events = ["pointerup", "touchend", "click", "keydown"];
-  const detach = () => { S.mic.armed = false; events.forEach((t) => document.removeEventListener(t, once, true)); };
+  const armAllowed = () => S.mode === "live" && faceDownPref() && !micStatus().live && recorderIdle();
+  const onDown = () => { if (armAllowed()) silentMicReconnect("touch"); };
+  const detach = () => {
+    S.mic.armed = false;
+    events.forEach((t) => document.removeEventListener(t, once, true));
+    document.removeEventListener("pointerdown", onDown, true);
+  };
   const once = async () => {
     if (busy) return;
     if (S.mode !== "live" || !faceDownPref()) return detach();
@@ -361,6 +454,7 @@ function armMicGesture() {
     if (ok) detach();
   };
   events.forEach((t) => document.addEventListener(t, once, true));
+  document.addEventListener("pointerdown", onDown, true);
 }
 
 /* 앱을 새로 열면 iOS 센서 권한은 다시 한 번 필요하다 → 첫 터치에서 조용히 요청
@@ -812,10 +906,39 @@ function renderFlipChip() {
   // 센서는 준비됐는데 마이크가 없다면 그 사실을 먼저 알린다(v1.4.1)
   if (flip.state !== "active" && faceDownPref() && !m.live) {
     label = S.mic.denied || m.state === "denied" ? "마이크 권한 차단됨 · 설정에서 허용"
+      : micEverAllowed() ? "마이크 연결 대기 · 화면을 한 번 탭"
       : "탭해서 마이크 연결";
   }
   const t = flip.state === "active" ? ` · ${fmtClock(flip.elapsedSec)}` : "";
-  el.innerHTML = `<span class="fc-dot"></span><span>뒤집어 녹음 · ${esc(label)}${t}</span>`;
+  /* v1.7: 마이크를 들고 있는 동안은 5칸 레벨 미터를 함께 보여, 대기 중에도 마이크가
+     실제로 소리를 받고 있는지 즉시 확인할 수 있게 한다(0을 무음으로 오탐하지 않는다). */
+  const meter = m.held ? `<span class="fc-meter" id="fc-meter" data-s="${m.live ? "live" : "wait"}" aria-hidden="true">${Array.from({ length: 5 }, () => "<i></i>").join("")}</span>` : "";
+  el.innerHTML = `<span class="fc-dot"></span><span>뒤집어 녹음 · ${esc(label)}${t}</span>${meter}`;
+  paintMicMeter();
+}
+
+/* 대기 중 마이크 레벨 — 5칸 막대. 상태가 '측정 대기'면 막대를 비워 0을 무음으로 보이지 않게 한다. */
+function paintMicMeter() {
+  const el = $("#fc-meter");
+  if (!el) return;
+  if (document.visibilityState !== "visible") return;
+  const st = micStatus();
+  if (!st.held) { el.hidden = true; return; }
+  el.hidden = false;
+  const m = micMeterRead();
+  el.dataset.s = m.state;
+  const level = Math.min(1, Math.sqrt(Math.max(0, m.rms || 0) * 26));
+  const bars = $$("i", el);
+  bars.forEach((b, i) => {
+    const on = m.state === "live" && level >= (i + 1) / (bars.length + 0.6);
+    b.classList.toggle("on", on);
+  });
+  el.title = m.state === "waiting" ? "마이크 레벨 측정 대기 · 화면을 한 번 탭하면 확인합니다"
+    : m.state === "nosignal" ? "마이크 신호가 없습니다"
+    : m.state === "silent" ? "마이크 연결됨 · 지금은 조용합니다"
+    : m.state === "interrupted" ? "마이크가 잠시 끊겼습니다 · 곧 다시 연결합니다"
+    : m.state === "lost" ? "마이크 연결이 끊겼습니다"
+    : "마이크 연결됨";
 }
 
 /* 설정 화면의 실시간 센서 표시 */
@@ -1039,6 +1162,7 @@ function bindGlobal() {
   $("#btn-today")?.addEventListener("click", gotoToday);
   $("#dn-month")?.addEventListener("click", openDayPicker);
   $("#btn-settings-back")?.addEventListener("click", () => setTab("timeline"));
+  $("#queue-dot")?.addEventListener("click", () => openQueueSheet());
   $("#fab").addEventListener("click", () => {
     if (recordingNow() || S.face.active || S.auto.on || S.res.on) { stopQuickRecording(); return; }
     startQuickRecording();
@@ -1073,7 +1197,7 @@ function bindGlobal() {
     renderSearch();
   }));
 
-  window.addEventListener("online", () => { if (S.mode === "live") syncNow(); });
+  window.addEventListener("online", () => { if (S.mode === "live") { syncNow(); queueTick(true); } });
   /* v1.6.1: 예약·엎기로 제스처 없이 시작한 녹음은 iOS 가 AudioContext 를 잠가
      "말한 구간"이 잡히지 않는다. 앱 안의 첫 탭(제스처)에서 바로 깨우고,
      화면 복귀·앞으로 오기에서도 깨운다(비용이 거의 없고 녹음에는 영향 없음). */
@@ -1134,8 +1258,8 @@ function bindGlobal() {
       rescueRecording("hidden");
       markBackgrounded();          // 스트림은 그대로 들고 간다(대여 유지)
     } else {
-      schedTick(); renderAutoBar(); resumeConnection();
-      resumeAfterBackground();
+      renderAutoBar(); resumeConnection();
+      scheduleResume();
       renderFlipChip();
       paintPill();
       S.swReg?.update?.().catch(() => {});
@@ -1148,12 +1272,12 @@ function bindGlobal() {
   window.addEventListener("pageshow", (e) => {
     // bfcache·프로세스 재개로 돌아온 경우: 권한을 다시 묻지 않고 감시만 되살린다
     if (!e.persisted) { renderFlipChip(); return; }
-    resumeAfterBackground();
+    scheduleResume();
     autoSyncNow({ force: true });
   });
   // focus 는 visibilitychange 를 놓치는 경우(데스크톱·안드로이드 브라우저)의 보조 신호
   window.addEventListener("focus", debounce(() => {
-    if (document.visibilityState === "visible") { resumeAfterBackground(); autoSyncNow({ force: true }); }
+    if (document.visibilityState === "visible") { scheduleResume(); autoSyncNow({ force: true }); }
   }, 700));
 
   /* 절전 오버레이를 탭하면 바로 종료·저장(시작이 막혀 있으면 시작) */
@@ -1201,12 +1325,20 @@ function bindGlobal() {
 
   /* 예열: 예약 녹음 20초마다 확인, 뒤집어 녹음은 첫 탭에서 센서 권한 */
   setInterval(schedTick, 20000);
+  /* v1.7: 업로드 재전송 큐 — 30초마다 조건만 보고(실패할수록 간격을 늘린다) 보낸다 */
+  setInterval(() => queueTick(), 30000);
+  /* v1.7: 대기 중 마이크 레벨 표시 — 화면이 보일 때만 8Hz로 읽는다 */
+  setInterval(() => { if (document.visibilityState === "visible") paintMicMeter(); }, 130);
   /* 자동 반영(v1.6): 5초마다 조건만 보고, 전사·요약 대기 중이면 20초·아니면 30초마다
      드라이브를 다시 읽는다. 녹음 중·화면 가려짐·동기화 중에는 건너뛴다. */
   setInterval(() => autoSyncNow(), AUTO_SYNC_TICK_MS);
   /* 마이크 연결 유지 감시(v1.4.1) — 엎기 대기 중에 트랙이 조용해졌으면 다시 잡는다.
      실패하면 간격을 늘려 iOS 에 권한 질문을 연속으로 던지지 않는다. */
-  onMicChange(() => { renderFlipChip(); paintFlipReadout(); });
+  onMicChange((s) => {
+    renderFlipChip(); paintFlipReadout();
+    // 마이크가 돌아오면 '들었다 다시 엎어야' 하던 막힘을 풀어 준다(v1.7)
+    if (s.live && flip.blockUntilRelease && flip.pose === "down") flip.unblock();
+  });
 /* 엎어 대기 중 마이크가 조용해지면 다시 잡는다. 녹음 중이거나 화면이 가려져 있으면 건드리지 않는다. */
   setInterval(() => {
     if (S.mode !== "live" || !faceDownPref()) return;
@@ -1292,6 +1424,7 @@ async function enterLive() {
   applyDeepLink();
   restoreFaceDown();                       // 저장된 뒤집어 녹음 설정을 되살린다(v1.5.1)
   checkLocalRecovery().catch(() => {});
+  refreshQueue({ force: true }).then(() => queueTick(true));   // 기기에 남은 업로드를 먼저 보낸다
   syncNow();
 }
 
@@ -1399,6 +1532,7 @@ async function syncNow({ manual = false, auto = false } = {}) {
     S.lastSync = Date.now();
     await store.setKV("lastSync", S.lastSync).catch(() => {});
     flushPending().catch(() => {});
+    refreshQueue();
     S.syncState = "idle";
     syncSpin(false);
     // 자동 반영으로 "전사 대기"가 실제 기록이 되면 조용하지 않게 한 번만 알린다
@@ -3361,29 +3495,108 @@ async function saveRecordingFast({ blob, duration, mime, title, type = "work", s
   try {
     await store.pendingPut({ id: fileName, blob, name: fileName, parent, mime: mimeType, at: Date.now(), title, type, duration, speechSec, started_at, segment });
   } catch (e) { console.warn("queue failed", e); }
-  // 2) 드라이브 업로드 시도
+  // 2) 드라이브 업로드 시도 — 실패해도 로컬 큐에 남으므로 배지를 갱신하고 다시 알린다
   if (parent) {
-    await drive.upload(blob, fileName, parent, { mimeType });
-    await store.pendingDel(fileName).catch(() => {});
+    try {
+      await drive.upload(blob, fileName, parent, { mimeType });
+      await store.pendingDel(fileName).catch(() => {});
+    } catch (e) {
+      refreshQueue({ force: true });
+      throw e;
+    }
   } else {
+    refreshQueue({ force: true });
     throw new Error("연결되지 않아 기기에만 보관했습니다");
   }
+  refreshQueue({ force: true });
   syncNow().catch(() => {});
   return fileName;
 }
 
-/* 대기 중 업로드 재시도 */
-async function flushPending() {
+/* 대기 중 업로드 재시도 (v1.7)
+   오프라인이거나 토큰이 만료되어 드라이브에 못 올린 녹음은 IndexedDB(pending)에 남는다.
+   예전에는 동기화가 성공했을 때만 재전송해서, 비행기모드에서 저장한 녹음이 계속 방치됐다.
+   이제 온라인·화면 복귀·앱 시작·30초 틱에서 조건을 보고(실패할수록 간격을 늘려) 보낸다. */
+let _queueRefreshAt = 0;
+async function refreshQueue({ force = false } = {}) {
+  if (Date.now() - _queueRefreshAt < 2000 && !force) return;
+  _queueRefreshAt = Date.now();
+  try {
+    const items = await store.pendingAll();
+    S.queue.count = items.length;
+  } catch { return; }
+  renderQueueDot();
+}
+
+function renderQueueDot() {
+  const el = $("#queue-dot");
+  if (!el) return;
+  const n = S.queue.count || 0;
+  el.hidden = n === 0;
+  el.dataset.fails = S.queue.fails ? "1" : "0";
+  const num = $("#queue-n", el);
+  if (num) num.textContent = n > 9 ? "9+" : String(n);
+  el.title = n ? `업로드 대기 ${n}건 · 탭해서 지금 올리기` : "";
+  el.setAttribute("aria-label", n ? `업로드 대기 ${n}건` : "업로드 대기 없음");
+}
+
+function queueTick(force = false) {
   if (S.mode !== "live") return;
+  if (S.queue.busy) return;
+  const due = force || queueDue({
+    now: Date.now(), lastTry: S.queue.lastTry, fails: S.queue.fails, count: S.queue.count,
+    online: navigator.onLine !== false, visible: document.visibilityState === "visible",
+  });
+  if (due && S.queue.count > 0) { S.queue.lastTry = Date.now(); flushPending().catch(() => {}); }
+  else refreshQueue();
+}
+
+async function flushPending({ manual = false } = {}) {
+  if (S.mode !== "live" || S.queue.busy) return { sent: 0 };
   let items = [];
-  try { items = await store.pendingAll(); } catch { return; }
-  for (const it of items) {
-    try {
-      const parent = it.parent || await drive.inbox();
-      await drive.upload(it.blob, it.name, parent, { mimeType: it.mime });
-      await store.pendingDel(it.id);
-    } catch { break; }
-  }
+  try { items = await store.pendingAll(); } catch { return { sent: 0 }; }
+  S.queue.count = items.length;
+  renderQueueDot();
+  if (!items.length) { S.queue.fails = 0; if (manual) toast("대기 중인 업로드가 없습니다"); return { sent: 0 }; }
+  S.queue.busy = true;
+  let sent = 0;
+  try {
+    for (const it of items) {
+      try {
+        const parent = it.parent || await drive.inbox();
+        await drive.upload(it.blob, it.name, parent, { mimeType: it.mime });
+        await store.pendingDel(it.id);
+        sent++;
+      } catch { break; }
+    }
+  } finally { S.queue.busy = false; }
+  S.queue.lastTry = Date.now();
+  S.queue.fails = sent ? 0 : (S.queue.fails || 0) + 1;
+  await refreshQueue({ force: true });
+  if (sent) syncNow().catch(() => {});
+  if (manual) toast(sent ? `${sent}건을 드라이브에 올렸습니다` : "지금은 올리지 못했습니다 · 연결을 확인해 주세요", 3000);
+  return { sent };
+}
+
+/* 업로드 대기 목록 — 탭하면 지금 올리기 */
+async function openQueueSheet() {
+  let items = [];
+  try { items = await store.pendingAll(); } catch { items = []; }
+  const rows = items.slice(0, 20).map((it) => `<div class="del-row"><span class="dr-t">${esc(fmtDay(it.at))} ${esc(fmtTime(it.at))}</span><span class="dr-n">${esc(it.title || it.name || "녹음")} · ${Math.max(1, Math.round((it.blob?.size || 0) / 1024))}KB</span></div>`).join("");
+  const sheet = openSheet({
+    title: "업로드 대기",
+    sub: items.length ? `${items.length}건이 기기에 보관되어 있습니다 · 연결되면 자동으로 올라갑니다` : "대기 중인 녹음이 없습니다",
+    body: `<div class="del-list">${rows || '<div class="del-row muted"><span>없음</span></div>'}</div>
+      <p class="note" style="margin-top:12px">녹음은 이미 기기(IndexedDB)에 안전하게 저장되어 있습니다. 지금 올리기를 눌러도 되고, 앱이 알아서 다시 시도합니다.</p>`,
+    foot: `<div style="display:flex;gap:8px"><button class="btn btn-ghost btn-block" id="q-close">닫기</button><button class="btn btn-primary btn-block" id="q-retry" ${items.length ? "" : "disabled"}>지금 올리기</button></div>`,
+  });
+  $("#q-close", sheet).addEventListener("click", () => closeSheet());
+  $("#q-retry", sheet).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+    await flushPending({ manual: true });
+    closeSheet();
+  });
 }
 
 /* ── 기기에 남은 녹음 복구 ──────────────────────────────

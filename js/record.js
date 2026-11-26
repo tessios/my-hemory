@@ -10,11 +10,20 @@
    (WebKit bug 215884 — "capture is not ongoing 이면 prompt 가 다시 뜬다")
    그래서 앱이 화면에 떠 있는 동안은 스트림을 닫지 않고 그대로 들고 있다가,
    녹음마다 **MediaRecorder 만 새로 만든다**. */
-import { micResumePlan, afterUnmuteWait } from "./lifecycle.js";
+import { micResumePlan, afterUnmuteWait, meterVerdict } from "./lifecycle.js";
 
 const MIC_CONSTRAINTS = { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } };
 
-const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set(), backgrounded: false, reopening: null };
+const mic = { stream: null, state: "idle", boundTrack: null, listeners: new Set(), backgrounded: false, reopening: null, opening: null };
+
+/* 이 사이트에서 마이크를 한 번이라도 연 적이 있는가 — 안내 문구 선택에만 쓴다(권한 판정 아님). */
+const MIC_ALLOWED_KEY = "hemory.micAllowed";
+export function micEverAllowed() {
+  try { return localStorage.getItem(MIC_ALLOWED_KEY) === "1"; } catch { return false; }
+}
+function markMicAllowed() {
+  try { localStorage.setItem(MIC_ALLOWED_KEY, "1"); } catch {}
+}
 
 /* 상태가 바뀔 때(끊김·복구·해제) 화면에 알린다 */
 export function onMicChange(fn) { mic.listeners.add(fn); return () => mic.listeners.delete(fn); }
@@ -69,8 +78,19 @@ export function acquireMic() {
     return Promise.resolve({ ok: true, reused: true, stream: mic.stream });
   }
   if (micPending) return micPending;
-  micPending = openMic().finally(() => { micPending = null; });
+  micPending = openMicShared();
   return micPending;
+}
+
+/* 마이크 열기는 앱 전체에서 **한 번에 하나**만 진행한다(v1.7).
+   예전에는 acquireMic 의 micPending 과 resumeMicAfterBackground 의 mic.reopening 이
+   따로 잠가, 두 경로가 동시에 들어오면 getUserMedia 가 두 번 나가 스트림이 둘 생길 수
+   있었다(iOS 는 캡처를 하나만 허용해 녹음 중이던 트랙이 ended 되는 사고로 이어진다). */
+function openMicShared(opts = {}) {
+  if (mic.opening) return mic.opening;
+  mic.opening = openMic(opts)
+    .finally(() => { mic.opening = null; micPending = null; });
+  return mic.opening;
 }
 
 async function openMic({ stopOld = true } = {}) {
@@ -85,6 +105,7 @@ async function openMic({ stopOld = true } = {}) {
     const s = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
     mic.stream = s;
     mic.state = "live";
+    markMicAllowed();            // 다음 실행에서 '탭 없이 시도해도 되는가'의 근거
     bindMicTrack(s);
     micNotify();
     return { ok: true, reused: false, stream: s };
@@ -157,7 +178,7 @@ export async function resumeMicAfterBackground({ waitMs = 1200 } = {}) {
   if (mic.reopening) return mic.reopening;
   mic.reopening = (async () => {
     const old = mic.stream;
-    const r = await openMic({ stopOld: false });
+    const r = await openMicShared({ stopOld: false });
     if (r.ok && old) { try { old.getTracks().forEach((x) => x.stop()); } catch {} }
     return { ok: r.ok, action: r.ok ? "reopened" : "gesture", reason: r.reason || "ok" };
   })().finally(() => { mic.reopening = null; });
@@ -173,6 +194,78 @@ export function releaseMic() {
   mic.state = "idle";
   micNotify();
 }
+
+/* ── 대기 중 마이크 레벨 (v1.7) ───────────────────────────────
+   대여(lease) 중인 스트림에 analyser 를 하나 붙여, 엎기 대기 상태에서도
+   마이크가 실제로 소리를 받고 있는지 눈으로 확인할 수 있게 한다.
+   · 컨텍스트가 running 이 아니면 '측정 대기'로 돌려준다(0 을 무음으로 단정하지 않는다).
+   · 정확히 0.0 이 1초 넘게 이어지면 '신호 없음', 바닥 잡음 수준이 3초 이어지면 '무음(정상)'.
+   읽기만 하며 녹음 경로에는 끼지 않는다(녹음은 원본 스트림을 그대로 담는다). */
+const meter = { ctx: null, src: null, analyser: null, track: null, buf: null, floor: 0, floorN: 0, zeroMs: 0, quietMs: 0, last: 0 };
+
+function detachMeter() {
+  try { meter.src?.disconnect(); } catch {}
+  try { meter.analyser?.disconnect(); } catch {}
+  meter.src = null; meter.analyser = null; meter.track = null; meter.buf = null;
+  meter.floor = 0; meter.floorN = 0; meter.zeroMs = 0; meter.quietMs = 0; meter.last = 0;
+}
+
+function attachMeter(track) {
+  detachMeter();
+  const ctx = unlockAudio();
+  if (!ctx || !mic.stream) return;
+  try {
+    const src = ctx.createMediaStreamSource(mic.stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    analyser.smoothingTimeConstant = 0.4;
+    src.connect(analyser);
+    meter.ctx = ctx; meter.src = src; meter.analyser = analyser; meter.track = track;
+    meter.buf = new Float32Array(analyser.fftSize);
+  } catch {
+    meter.analyser = null;
+  }
+}
+
+/** 지금 대여 중인 마이크의 레벨·상태를 읽는다. 호출한 쪽이 화면이 보일 때만 주기적으로 부른다. */
+export function micMeterRead() {
+  const t = micTrack();
+  if (!mic.stream || !t) { detachMeter(); return { state: "none", rms: 0, peak: 0, floor: 0, ctx: "none" }; }
+  if (meter.track !== t || !meter.analyser) attachMeter(t);
+  const running = meter.ctx?.state === "running";
+  let rms = null, peak = 0;
+  if (running && meter.analyser) {
+    try {
+      const a = meter.analyser;
+      const buf = meter.buf && meter.buf.length === a.fftSize ? meter.buf : (meter.buf = new Float32Array(a.fftSize));
+      if (typeof a.getFloatTimeDomainData === "function") a.getFloatTimeDomainData(buf);
+      else {
+        const b = new Uint8Array(a.fftSize);
+        a.getByteTimeDomainData(b);
+        for (let i = 0; i < b.length; i++) buf[i] = (b[i] - 128) / 128;
+      }
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) { const v = buf[i] || 0; if (Math.abs(v) > peak) peak = Math.abs(v); sum += v * v; }
+      rms = Math.sqrt(sum / buf.length);
+    } catch { rms = null; }
+  }
+  const now = Date.now();
+  const dt = meter.last ? Math.min(500, Math.max(0, now - meter.last)) : 0;
+  meter.last = now;
+  if (rms != null) {
+    if (rms === 0) meter.zeroMs += dt; else meter.zeroMs = 0;
+    if (meter.floorN < 40) { meter.floor = (meter.floor * meter.floorN + rms) / (++meter.floorN); }
+    const quietRef = Math.max(0.004, meter.floor * 2);
+    if (rms > 0 && rms <= quietRef) meter.quietMs += dt; else meter.quietMs = 0;
+  }
+  const state = meterVerdict({
+    hasStream: true, ended: t.readyState !== "live", muted: !!t.muted,
+    ctxRunning: running, rms, zeroMs: meter.zeroMs, quietMs: meter.quietMs, floor: meter.floor,
+  });
+  return { state, rms: rms ?? 0, peak, floor: meter.floor, ctx: meter.ctx?.state || "none" };
+}
+
+export function micMeterReset() { detachMeter(); }
 
 /* MediaRecorder 에는 대여 중인 트랙을 감싼 **별도 스트림**을 넘긴다.
    그래야 녹음기 정리 코드가 원본(대여) 트랙을 실수로 stop 하는 일이 없다. */
@@ -463,10 +556,10 @@ export class Recorder {
     this.stream = got.stream;
     this.mime = this._pickMime();
 
-    const AC = window.AudioContext || window.webkitAudioContext;
-    const shared = unlockAudio();           // 제스처로 깨워 둔 컨텍스트가 있으면 그대로 쓴다
-    this._ownCtx = !shared;
-    this.ctx = shared || new AC();
+    const shared = unlockAudio();           // 앱 전체에서 AudioContext 하나만 쓴다(v1.7 — iOS 동시 컨텍스트 한도·세션 종류 혼재 방지)
+    if (!shared) throw new Error("오디오를 사용할 수 없습니다");
+    this.ctx = shared;
+    this._ownCtx = false;
     try { await this.ctx.resume?.(); } catch {}
     // 사용자 제스처 없이(엎어서) 시작하면 AudioContext 가 suspended 로 남을 수 있다.
     //   그때 레벨 측정은 0 이 되므로 '무음'이라고 단정하지 않는다(원음은 스트림에서 그대로 담긴다).
@@ -701,8 +794,9 @@ export class Recorder {
       const fin = () => { if (!done) { done = true; resolve(); } };
       prev.onstop = fin;
       try { if (prev.state !== "inactive") prev.stop(); else fin(); } catch { fin(); }
-      setTimeout(fin, 2000);      // onstop 이 오지 않는 브라우저에서도 멈추지 않게
+      setTimeout(fin, 4000);      // 꼬리 청크가 늦게 오는 경우를 조금 더 기다린다(v1.7: 1.5s→4s)
     });
+    try { prev.ondataavailable = null; } catch {}
     const type = this.mime || "audio/mp4";
     const blob = new Blob(prevChunks, { type });
 
@@ -731,13 +825,22 @@ export class Recorder {
     const speech = this.vad ? Math.min(this.speechSec, duration) : null;
     const from = this.vad ? (this.speechFromSec ?? 0) : null;
     const rec = this.rec;
+    /* v1.7: 꼬리 청크가 늦게 와서 잘리는 일을 줄이려고 4초까지 기다린다.
+       그래도 오지 않으면 그때까지 담긴 것으로 저장하고 truncated 로 표시한다. */
+    let truncated = false;
     await new Promise((resolve) => {
       let done = false;
-      const fin = () => { if (!done) { done = true; resolve(); } };
-      rec.onstop = fin;
-      try { if (rec.state !== "inactive") rec.stop(); else fin(); } catch { fin(); }
-      setTimeout(fin, 1500);      // 앱이 가려진 직후 등 onstop 이 늦거나 오지 않아도 저장을 막지 않는다
+      const fin = (late = false) => {
+        if (done) return;
+        done = true;
+        if (late) truncated = true;
+        resolve();
+      };
+      rec.onstop = () => fin(false);
+      try { if (rec.state !== "inactive") rec.stop(); else fin(false); } catch { fin(false); }
+      setTimeout(() => fin(true), 4000);
     });
+    try { rec.ondataavailable = null; } catch {}     // 늦게 오는 청크는 이미 만든 Blob 뒤에 붙이지 않는다
     const type = this.mime || "audio/mp4";
     const blob = new Blob(this.chunks, { type });
     const maxRms = this.maxRms;
@@ -745,7 +848,7 @@ export class Recorder {
     this.state = "done";
     this._teardown();
     this._notify();
-    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, speechFromSec: from, maxRms, silentAlerted };
+    return { blob, duration, mime: type, vad: this.vad, speechSec: speech, speechFromSec: from, maxRms, silentAlerted, truncated };
   }
 
   cancel() {
