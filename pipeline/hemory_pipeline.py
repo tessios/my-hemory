@@ -602,13 +602,15 @@ def gemini_generate(parts: list, cfg: dict, json_mode: bool = False, model: str 
                     if e.code not in (404, 429, 500, 502, 503, 504):
                         raise
                     log(f"  · 모델 {cand} 실패({e.code}) → 다음 모델로 재시도")
-                    if e.code in (429, 500, 502, 503, 504):
-                        time.sleep(2 + 2 * rnd)       # 바로 다시 쏘면 같은 429/503 이 온다
+                    # 429(분당/일 한도)는 오래 갈 수 있어 짧게만 쉬고, 503(과부하)은 조금 더 쉰다
+                    time.sleep(3 if e.code == 429 else 2 + 2 * rnd)
                 except (TimeoutError, urllib.error.URLError) as e:
                     last = e
                     log(f"  · 모델 {cand} 시간 초과/연결 실패 → 다음 모델로 재시도")
             code = getattr(last, "code", None)
-            if rnd == 0 and code in (429, 500, 502, 503, 504):
+            # 503·500 은 잠깐 뒤 풀리는 경우가 많아 한 바퀴 더, 429 는 대기 비용만 커져
+            #   여기서 멈추고 '요약 없는 기록'으로 두었다가 상주 감시(30분)가 다시 채운다.
+            if rnd == 0 and code in (500, 502, 503, 504):
                 log("  · 잠시 쉽니다(15초) 뒤 한 바퀴 더 시도")
                 time.sleep(15)
             else:
