@@ -11,6 +11,7 @@ import {
   previewLine, segmentRangeLabel, segmentDue, groupTranscript, silentVerdict, recordSegmentLabel, SEGMENT_SEC,
   timelineFlow, weekDays, dateKeyOf, blockRangeLabel, CATEGORY_WORD, minutesOf, hhmm,
   autoSyncDue, recordSignature, AUTO_SYNC_TICK_MS,
+  scheduleSlotOf, mutedAutoSlot, nextAutoAction,
 } from "./pure.js";
 import { sensorResumePlan, sensorQuietLabel, SENSOR_QUIET_MS } from "./lifecycle.js";
 import {
@@ -33,9 +34,9 @@ const S = {
   recordingSheet: null,
   sheet: null,
   day: dateKeyOf(new Date()),                 // 타임라인이 보여 주는 날
-  auto: { on: false, pending: false, failAt: 0, startedAt: 0, type: "work", timer: null, gestureBound: false },
+  auto: { on: false, pending: false, stopping: false, failAt: 0, startedAt: 0, type: "work", timer: null, gestureBound: false },
   sel: { on: false, ids: new Set() },          // 타임라인 선택 모드
-  seg: { index: 0, startAt: 0, timer: null, type: "work" },  // 30분 세그먼트
+  seg: { index: 0, startAt: 0, timer: null, type: "work", rotating: null },  // 30분 세그먼트
   segSession: null,                            // 로컬 적립 중인 녹음 세션 메타
   mic: { warn: false, denied: false, nextTry: 0, armed: false, resumeAt: 0 },   // 마이크 연결 유지 감시
   week: [],                                    // 현재 주간 바
@@ -97,6 +98,26 @@ function scheduleActiveNow(now = new Date()) {
   if (!sch.enabled) return null;
   const d = sch.days[DAY_KEYS[now.getDay()]];
   return inWindow(now, d) ? d : null;
+}
+
+/* ── 예약 슬롯 억제(v1.6.2) ───────────────────────────
+   사용자가 예약 녹음 [종료]를 직접 누르면 그 슬롯이 끝날 때까지 자동으로 다시 켜지 않는다.
+   예전에는 종료 후 20초 틱·화면 복귀에서 schedTick 이 즉시 다시 켜서 '종료가 안 먹히는' 것처럼 보였다. */
+function autoMute() {
+  const m = localSettings().autoMute;
+  return m && typeof m === "object" ? m : null;
+}
+function autoMutedNow(now = new Date()) {
+  const slot = scheduleSlotOf(now, scheduleActiveNow(now));
+  return !!slot && mutedAutoSlot(autoMute(), slot.id, now.getTime());
+}
+function setAutoMute(slot) {
+  if (!slot) return;
+  saveSettings({ autoMute: { slot: slot.id, until: slot.until, at: Date.now() } });
+}
+/* 예약 설정을 바꾸면 억제를 풀어 새 설정대로 동작하게 한다 */
+function clearAutoMute() {
+  if (autoMute()) saveSettings({ autoMute: null });
 }
 
 /* 녹음 상태가 바뀔 때마다 화면 조각들을 다시 그린다 */
@@ -240,6 +261,10 @@ async function resumeAfterBackground() {
     }
 
     /* 떠날 때 녹음 중이었다면 이어서 녹음(v1.5.1) */
+    if (S.resume.armed) {
+      // 사용자가 그 예약 슬롯을 직접 꺼 두었으면 이어서 녹음도 시작하지 않는다(v1.6.2)
+      if (S.resume.kind === "auto" && autoMutedNow()) S.resume.armed = false;
+    }
     if (S.resume.armed) {
       const st = micStatus();
       const perm = await micPermissionState();
@@ -552,14 +577,21 @@ function segLimitSec() {
 }
 async function segTick() {
   if (S.recorder.state !== "recording") return;
+  if (S.auto.stopping || S.seg.rotating) return;      // 종료·회전 중에는 새로 돌리지 않는다
   if (!segmentDue(S.seg.startAt, Date.now(), segLimitSec())) return;
   await segRotate();
 }
 async function segRotate() {
-  const index = S.seg.index;
+  if (S.seg.rotating) return;
   const startAt = S.seg.startAt;
-  const out = await S.recorder.rotate();
+  // rotate 는 스트림은 두고 MediaRecorder 만 바꾼다 — 그 사이 stop 이 들어오면
+  //   stop 이 이 promise 를 기다렸다가 마무리한다(그래야 새 recorder 가 고아로 남지 않는다).
+  const p = S.recorder.rotate();
+  S.seg.rotating = p;
+  let out = null;
+  try { out = await p; } finally { if (S.seg.rotating === p) S.seg.rotating = null; }
   if (!out || !out.blob?.size) return;
+  const index = S.seg.index;
   const endAt = Date.now();
   S.seg.index = index + 1;
   S.seg.startAt = endAt;
@@ -978,6 +1010,7 @@ async function hardReloadVersion(latest) {
 function bindGlobal() {
   drive.canNavigate = canLeaveApp;
   wireRecorder();
+  $("#auto-bar")?.addEventListener("click", onAutoBarClick);   // 예약 바는 매초 바뀌므로 위임(v1.6.2)
   $("#conn-bar")?.addEventListener("click", reconnect);
   $("#btn-signin").addEventListener("click", async () => {
     if (!drive.configured) return openSetupSheet();
@@ -2542,6 +2575,7 @@ async function renderSettings() {
   /* 예약 녹음 */
   $("#s-sch-on").addEventListener("click", () => {
     const next = saveSchedule({ enabled: !getSchedule().enabled });
+    clearAutoMute();                     // 설정을 바꾸면 '이 슬롯은 꺼 둠'도 풀린다
     renderSettings();
     toast(next.enabled ? "예약 녹음 모드를 켰습니다" : "예약 녹음 모드를 껐습니다");
     schedTick();
@@ -2551,6 +2585,7 @@ async function renderSettings() {
     const cur = getSchedule();
     const days = { ...cur.days, [k]: { ...cur.days[k], on: !cur.days[k].on } };
     saveSchedule({ days });
+    clearAutoMute();
     renderSettings();
     schedTick();
   }));
@@ -2563,6 +2598,7 @@ async function renderSettings() {
     }
     const days = { ...cur.days, [k]: { ...cur.days[k], [field]: val } };
     saveSchedule({ days });
+    clearAutoMute();
     toast("예약 시간을 저장했습니다");
     schedTick();
   }));
@@ -3092,29 +3128,70 @@ async function uploadTranscriptForExisting(rec, data, blob) {
   }
 }
 
-/* ────────────────────────────────── 예약 녹음 · 유실 방지 ── */
+/* ────────────────────────────────── 예약 녹음 · 유실 방지 ──
+   v1.6.2: 예약 바를 매초 innerHTML 로 통째로 다시 그리면 종료 버튼 노드가 손가락이 닿는
+   순간 교체되어 click 이벤트가 아예 사라진다("종료를 눌러도 안 꺼짐"). 그래서 골격은
+   상태가 바뀔 때 한 번만 만들고, 매초 시간 글자만 갈아끼운다. 클릭은 바 하나에 위임한다. */
 function renderAutoBar() {
   const bar = $("#auto-bar");
   if (!bar) return;
-  if (!S.auto.on) { bar.hidden = true; bar.innerHTML = ""; bar.classList.remove("show"); return; }
   const now = new Date();
-  const d = getSchedule().days[DAY_KEYS[now.getDay()]] || {};
-  const el = (Date.now() - S.auto.startedAt) / 1000;
-  const speech = S.recorder.speechSec || 0;
-  const ready = S.recorder.speechReady;
+  const day = scheduleActiveNow(now);
+  const slot = scheduleSlotOf(now, day);
+  const muted = !!slot && mutedAutoSlot(autoMute(), slot.id, now.getTime());
+  const mode = S.mode === "live" ? (S.auto.on ? "rec" : muted ? "muted" : "") : "";
+  if (!mode) {
+    if (bar.dataset.mode) { bar.hidden = true; bar.innerHTML = ""; delete bar.dataset.mode; bar.classList.remove("show"); }
+    return;
+  }
   bar.hidden = false;
   bar.classList.add("show");
-  bar.innerHTML = `<span class="ab-dot"></span>
-    <div class="ab-main"><b>예약 녹음 중</b>
-      <span>${esc(d.start || "")}~${esc(d.end || "")} · ${fmtClock(el)} · 말한 구간 ${ready ? fmtClock(speech) : "확인 중"}${ready && (S.recorder.speechFromSec || 0) > 0 ? ` (측정 ${fmtClock(S.recorder.speechFromSec)}부터)` : ""}</span></div>
-    <button class="ab-stop" id="ab-stop">종료</button>`;
-  $("#ab-stop", bar).addEventListener("click", () => stopAutoRecording({ reason: "manual" }));
+  if (bar.dataset.mode !== mode) {
+    bar.dataset.mode = mode;
+    bar.innerHTML = mode === "rec"
+      ? `<span class="ab-dot"></span>
+    <div class="ab-main"><b>예약 녹음 중</b><span id="ab-info"></span></div>
+    <button class="ab-stop" id="ab-stop" type="button">종료</button>`
+      : `<span class="ab-dot muted"></span>
+    <div class="ab-main"><b>이번 예약 녹음은 꺼 두었습니다</b><span id="ab-info"></span></div>
+    <button class="ab-again" id="ab-again" type="button">다시 켜기</button>`;
+  }
+  const info = $("#ab-info", bar);
+  if (!info) return;
+  if (mode === "rec") {
+    const el = (Date.now() - S.auto.startedAt) / 1000;
+    const speech = S.recorder.speechSec || 0;
+    const ready = S.recorder.speechReady;
+    info.textContent = `${day?.start || ""}~${day?.end || ""} · ${fmtClock(el)} · 말한 구간 ${ready ? fmtClock(speech) : "확인 중"}${ready && (S.recorder.speechFromSec || 0) > 0 ? ` (측정 ${fmtClock(S.recorder.speechFromSec)}부터)` : ""}`;
+  } else {
+    const end = new Date(slot.until);
+    info.textContent = `${hhmm(slot.startMin)}~${hhmm(slot.endMin)} 예약 · ${hhmm(end.getHours() * 60 + end.getMinutes())}까지 자동 시작 안 함`;
+  }
+}
+
+/* 예약 바 클릭 — 바가 매초 다시 그려져도 핸들러는 한 번만 걸린다 */
+function onAutoBarClick(e) {
+  if (e.target.closest(".ab-stop")) { stopAutoRecording({ reason: "manual" }); return; }
+  if (e.target.closest(".ab-again")) { resumeAutoSlot(); }
+}
+
+/* "다시 켜기" — 억제를 풀고 이 제스처 안에서 바로 시작한다 */
+async function resumeAutoSlot() {
+  const day = scheduleActiveNow();
+  clearAutoMute();
+  if (!day) { renderAutoBar(); return; }
+  const ok = await startAutoRecording(day);
+  renderAutoBar();
+  if (!ok) toast("예약 녹음을 다시 켜지 못했습니다 · 화면을 한 번 탭해 주세요", 3200);
 }
 
 async function startAutoRecording(day) {
-  if (S.mode !== "live" || S.auto.on || S.auto.pending) return false;
+  if (S.mode !== "live" || S.auto.on || S.auto.pending || S.auto.stopping) return false;
   if (S.sheet?._rec) return false;
   if (!recorderIdle()) return false;
+  const now = new Date();
+  const slot = scheduleSlotOf(now, day || scheduleActiveNow(now));
+  if (slot && mutedAutoSlot(autoMute(), slot.id, now.getTime())) return false;   // 사용자가 끈 슬롯
   S.auto.pending = true;
   try {
     // 뒤집어 녹음 대기 중이면 마이크를 계속 들고 있다(다음 엎기에도 바로 시작)
@@ -3144,16 +3221,31 @@ async function startAutoRecording(day) {
 }
 
 async function stopAutoRecording({ reason = "end" } = {}) {
-  if (!S.auto.on) return;
+  if (!S.auto.on || S.auto.stopping) return;
+  S.auto.stopping = true;
+  /* 사용자가 직접 껐다면 저장보다 먼저 억제를 걸어 둔다 — 저장이 늦거나 실패해도
+     틱·화면 복귀가 다시 켜지 못하게 (이 순서가 "안 꺼짐"의 핵심 방어선) */
+  if (reason === "manual") setAutoMute(scheduleSlotOf(new Date(), scheduleActiveNow()));
   S.resume.armed = false;            // 예약 녹음을 멈추면 '이어서 녹음' 대기도 끝난다
   clearInterval(S.auto.timer);
   S.auto.timer = null;
   stopSegTimer();
+  const type = S.auto.type || "work";
+  let out = null;
+  try {
+    // 진행 중인 30분 회전이 있으면 끝나기를 기다린다(그러지 않으면 새 recorder 가 고아로 남는다)
+    if (S.seg.rotating) { try { await S.seg.rotating; } catch {} }
+    out = await S.recorder.stop();
+  } catch (e) {
+    console.warn("auto stop failed", e);
+    try { S.recorder.cancel(); } catch {}     // 그래도 사용자에게는 확실히 꺼진 상태로
+  } finally {
+    S.auto.on = false;
+    S.auto.stopping = false;
+    renderAutoBar();
+  }
   const segIndex = S.seg.index;
   const segStart = S.seg.startAt || S.auto.startedAt;
-  const out = await S.recorder.stop();
-  S.auto.on = false;
-  renderAutoBar();
   if (!out || !out.blob?.size) { endLocalSession(); return; }
   const endAt = Date.now();
   const label = segmentRangeLabel(segStart, endAt);
@@ -3162,12 +3254,12 @@ async function stopAutoRecording({ reason = "end" } = {}) {
     : `${label} 녹음`;
   try {
     await saveRecordedOut(out, {
-      title, type: S.auto.type || "work",
+      title, type,
       startedAt: new Date(segStart).toISOString(),
       segment: { index: segIndex, start: new Date(segStart).toISOString(), end: new Date(endAt).toISOString(), label },
     });
     endLocalSession();
-    toast(reason === "end" ? "예약 시간이 끝나 자동 저장했습니다" : "예약 녹음을 저장했습니다");
+    toast(reason === "end" ? "예약 시간이 끝나 자동 저장했습니다" : "예약 녹음을 저장했습니다 · 이 시간대에는 다시 켜지 않습니다", 3600);
   } catch (e) {
     toast("기기에 보관했습니다 · 연결되면 올라갑니다");
   }
@@ -3175,9 +3267,17 @@ async function stopAutoRecording({ reason = "end" } = {}) {
 
 function schedTick() {
   if (S.mode !== "live") return;
-  const day = scheduleActiveNow();
-  if (day && !S.auto.on && !S.auto.pending && Date.now() - (S.auto.failAt || 0) > 60000) startAutoRecording(day);
-  else if (!day && S.auto.on) stopAutoRecording({ reason: "end" });
+  const now = new Date();
+  const day = scheduleActiveNow(now);
+  const slot = scheduleSlotOf(now, day);
+  const act = nextAutoAction({
+    active: !!day, slotId: slot?.id || "", now: now.getTime(),
+    on: S.auto.on, pending: S.auto.pending, stopping: S.auto.stopping,
+    busy: !recorderIdle(), failAt: S.auto.failAt, mute: autoMute(),
+  });
+  if (act === "start") startAutoRecording(day);
+  else if (act === "stop") stopAutoRecording({ reason: "end" });
+  else renderAutoBar();          // 꺼 둔 슬롯 표시를 새로 그리고, 창이 끝나면 내린다
 }
 
 function armGestureRetry() {

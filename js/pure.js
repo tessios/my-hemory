@@ -290,3 +290,53 @@ export function recordSignature(records = []) {
     .sort()
     .join(",");
 }
+
+/* ── 예약 슬롯 (v1.6.2) ───────────────────────────────────────────────
+   "사용자가 이 예약 시간대에서 직접 껐다"를 기억하려면 '어느 슬롯인지'가 필요하다.
+   슬롯 = 창이 시작된 날짜 + 시작·끝 시각. 자정을 넘기는 구간(22:00~06:00)은
+   00시~끝 시각대가 전날 시작한 창에 속하므로 시작 날짜를 하루 앞으로 잡는다.
+   until 은 그 창이 끝나는 절대 시각(ms)이다. */
+export function scheduleSlotOf(now = new Date(), d = null) {
+  if (!d || !d.on) return null;
+  const toMin = (s) => {
+    const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || ""));
+    if (!m) return null;
+    const h = Number(m[1]), mm = Number(m[2]);
+    if (h > 24 || mm > 59) return null;
+    return (h % 24) * 60 + mm;
+  };
+  const a = toMin(d.start), b = toMin(d.end);
+  if (a == null || b == null || a === b) return null;
+  const cur = now.getHours() * 60 + now.getMinutes();
+  const crosses = a > b;
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  if (crosses && cur < b) start.setDate(start.getDate() - 1);
+  let until = start.getTime() + b * 60000;
+  while (until <= now.getTime()) until += 86400000;   // 자정을 넘겨 오늘 끝나는 창
+  return { id: `${dateKeyOf(start)}|${d.start}|${d.end}`, start: start.getTime(), until, startMin: a, endMin: b };
+}
+
+/* 사용자가 껐던 슬롯인가 — 슬롯 id 가 같고 그 창이 아직 끝나지 않았을 때만 */
+export function mutedAutoSlot(mute = null, slotId = "", now = Date.now()) {
+  if (!mute || !mute.slot || !slotId) return false;
+  if (mute.slot !== slotId) return false;
+  return !(Number.isFinite(mute.until) && now >= mute.until);
+}
+
+/* 예약 녹음 재시도 간격(마이크가 막혔을 때) */
+export const AUTO_RETRY_MS = 60000;
+
+/* 예약 녹음 틱이 지금 해야 할 일: "start" | "stop" | null
+   startAutoRecording/stopAutoRecording 을 직접 부르지 않고 이 판단만 테스트한다. */
+export function nextAutoAction({
+  active = false, slotId = "", now = Date.now(), on = false, pending = false,
+  stopping = false, busy = false, failAt = 0, mute = null, retryMs = AUTO_RETRY_MS,
+} = {}) {
+  if (!active) return on ? "stop" : null;
+  if (on || pending) return null;
+  if (stopping) return null;
+  if (mutedAutoSlot(mute, slotId, now)) return null;
+  if (busy) return null;
+  if (now - (failAt || 0) <= (retryMs || 0)) return null;
+  return "start";
+}

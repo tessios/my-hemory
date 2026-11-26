@@ -453,6 +453,8 @@ input,textarea{font:inherit;color:inherit}
 .ab-main b{display:block;font-size:12.5px;font-weight:600}
 .ab-main span{display:block;font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ab-stop{flex:0 0 auto;font-size:12px;font-weight:600;padding:7px 12px;border-radius:10px;background:rgba(255,255,255,.1);color:var(--ink)}
+.ab-again{flex:0 0 auto;font-size:12px;font-weight:600;padding:7px 12px;border-radius:10px;background:var(--acc);color:#0b0b0c}
+.ab-dot.muted{background:var(--muted);animation:none}
 
 /* Google 연결이 필요할 때만 나오는 막대 */
 .conn-bar{
