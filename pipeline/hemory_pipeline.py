@@ -587,9 +587,16 @@ def gemini_generate(parts: list, cfg: dict, json_mode: bool = False, model: str 
         # 단종(404)·과부하(503/429) 모델을 만나면 다음 모델로 넘어가고,
         # 그래도 안 되면 잠시 쉬었다(무료 티어 분당 한도) 한 바퀴 더 돈다.
         fallbacks = [m for m in cfg["summary"].get("fallback_models", []) if m and m != mdl]
+        # 무료 티어는 '모델당' 하루 한도가 따로 있다 — 매 호출마다 시작 모델을 돌려 쿼터를 나눠 쓴다.
+        cands = [mdl] + fallbacks
+        global _MODEL_RR
+        if len(cands) > 1:
+            k = _MODEL_RR % len(cands)
+            cands = cands[k:] + cands[:k]
+            _MODEL_RR += 1
         last: Exception | None = None
         for rnd in range(2):
-            for cand in [mdl] + fallbacks:
+            for cand in cands:
                 req = urllib.request.Request(
                     f"https://generativelanguage.googleapis.com/v1beta/models/{cand}:generateContent?key={urllib.parse.quote(key)}",
                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
@@ -815,6 +822,9 @@ def build_record(item: dict, segs: list[dict], info: dict, summary: dict, diar: 
 
 
 _CFG_REF: dict = {}
+_MODEL_RR = 0                      # 요약 모델 라운드로빈 위치(무료 티어 모델별 한도 분산)
+
+
 def cfg_model() -> str:
     return _CFG_REF.get("summary", {}).get("model", "")
 
