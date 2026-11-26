@@ -4,7 +4,7 @@ import { drive, AuthError } from "./drive.js";
 import { store } from "./store.js";
 import { buildIndex, search as doSearch, evidence, keywords, highlight } from "./search.js";
 import { ask as askGemini, transcribe as geminiTranscribe, hasGemini } from "./qa.js";
-import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground, micPermissionState, leaseReady } from "./record.js";
+import { Recorder, pickAudioFile, extFor, mimeFor, probeDuration, prewarmMic, unlockAudio, acquireMic, releaseMic, micStatus, onMicChange, markBackgrounded, resumeMicAfterBackground, micPermissionState } from "./record.js";
 import { FlipWatcher } from "./flip.js";
 import { flipBootPlan, resumePlan, RESUME_GAP_MS } from "./flow.js";
 import {
