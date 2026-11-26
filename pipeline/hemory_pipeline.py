@@ -55,6 +55,7 @@ GROWING_STABLE_SEC = 4            # 상주 감시에서 크기가 이만큼 지�
 WATCH_INTERVAL_SEC = 15            # 상주 감시 폴링 간격(초)
 WATCH_HEARTBEAT_SEC = 600          # 조용할 때 대기 로그를 남기는 간격(초)
 PRUNE_INTERVAL_SEC = 3600          # 상주 감시 중 365일 정리를 다시 도는 간격(초)
+RESUMMARIZE_INTERVAL_SEC = 1800    # 상주 감시 중 '요약이 빈 기록'을 다시 채우는 간격(초)
 DEADMAN_SEC = 3 * 3600             # 마지막 성공이 이보다 오래되면 경고
 
 
@@ -569,25 +570,35 @@ def gemini_generate(parts: list, cfg: dict, json_mode: bool = False, model: str 
                 "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192}}
         if json_mode:
             body["generationConfig"]["responseMimeType"] = "application/json"
-        # 단종(404)·과부하(503) 모델을 만나면 다음 모델로 넘어간다
+        # 단종(404)·과부하(503/429) 모델을 만나면 다음 모델로 넘어가고,
+        # 그래도 안 되면 잠시 쉬었다(무료 티어 분당 한도) 한 바퀴 더 돈다.
         fallbacks = [m for m in cfg["summary"].get("fallback_models", []) if m and m != mdl]
         last: Exception | None = None
-        for cand in [mdl] + fallbacks:
-            req = urllib.request.Request(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{cand}:generateContent?key={urllib.parse.quote(key)}",
-                data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=600) as r:
-                    j = json.loads(r.read())
-                return "".join(p.get("text", "") for p in j["candidates"][0]["content"]["parts"]).strip()
-            except urllib.error.HTTPError as e:
-                last = e
-                if e.code not in (404, 429, 500, 502, 503, 504):
-                    raise
-                log(f"  · 모델 {cand} 실패({e.code}) → 다음 모델로 재시도")
-            except (TimeoutError, urllib.error.URLError) as e:
-                last = e
-                log(f"  · 모델 {cand} 시간 초과/연결 실패 → 다음 모델로 재시도")
+        for rnd in range(2):
+            for cand in [mdl] + fallbacks:
+                req = urllib.request.Request(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/{cand}:generateContent?key={urllib.parse.quote(key)}",
+                    data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}, method="POST")
+                try:
+                    with urllib.request.urlopen(req, timeout=600) as r:
+                        j = json.loads(r.read())
+                    return "".join(p.get("text", "") for p in j["candidates"][0]["content"]["parts"]).strip()
+                except urllib.error.HTTPError as e:
+                    last = e
+                    if e.code not in (404, 429, 500, 502, 503, 504):
+                        raise
+                    log(f"  · 모델 {cand} 실패({e.code}) → 다음 모델로 재시도")
+                    if e.code in (429, 500, 502, 503, 504):
+                        time.sleep(2 + 2 * rnd)       # 바로 다시 쏘면 같은 429/503 이 온다
+                except (TimeoutError, urllib.error.URLError) as e:
+                    last = e
+                    log(f"  · 모델 {cand} 시간 초과/연결 실패 → 다음 모델로 재시도")
+            code = getattr(last, "code", None)
+            if rnd == 0 and code in (429, 500, 502, 503, 504):
+                log("  · 잠시 쉽니다(15초) 뒤 한 바퀴 더 시도")
+                time.sleep(15)
+            else:
+                break
         raise RuntimeError(f"Gemini 호출 실패: {last}")
 
     # CLI 대체 경로 (gemini CLI 로그인돼 있으면 API 키 없이도 동작)
@@ -1193,6 +1204,7 @@ def resummarize(be, cfg: dict, since: dt.date | None = None, until: dt.date | No
                 continue
             log(f"  · 갱신: {rec['title']} [{rec.get('type')}] · {rec['summary']['one_line'][:60]}")
             done += 1
+            time.sleep(2)                        # 무료 티어 분당 한도에 걸리지 않게 간격을 둔다
             if limit and done >= limit:
                 return done
     return done
@@ -1260,6 +1272,7 @@ def watch(cfg: dict, interval: int = WATCH_INTERVAL_SEC, dry: bool = False, limi
                  watch_interval_sec=interval)
     last_beat = 0.0
     last_prune = 0.0
+    last_resum = time.time()          # 시작 직후엔 몰아서 하지 않는다(전사 우선)
     cycles = 0
     total_done = 0
     while not _STOP["flag"]:
@@ -1288,6 +1301,19 @@ def watch(cfg: dict, interval: int = WATCH_INTERVAL_SEC, dry: bool = False, limi
         if now - last_prune >= PRUNE_INTERVAL_SEC:
             _run_prune(config_path)
             last_prune = time.time()
+        # Gemini 장애로 요약만 빈 기록을 스스로 다시 채운다(오늘 것만·한 번에 5건)
+        if now - last_resum >= RESUMMARIZE_INTERVAL_SEC:
+            last_resum = time.time()
+            try:
+                be2 = make_backend(cfg)
+                today = now_local().date()
+                n2 = resummarize(be2, cfg, since=today, until=today, limit=5, diarize_again=False)
+                if n2:
+                    log(f"· 요약이 비어 있던 기록 {n2}건을 채웠습니다")
+                    write_status(watch_last_resummarize_at=now_local().isoformat(timespec="seconds"),
+                                 watch_resummarized_total=n2)
+            except Exception as e:
+                log(f"! 다시 요약 실패(다음 회차에 재시도): {e}")
         _sleep_until_stop(max(1.0, interval - (time.time() - t0)))
     log(f"상주 감시 종료 · {cycles}회 확인 · 누적 처리 {total_done}건")
     write_status(watch_pid=0, watch_stopped_at=now_local().isoformat(timespec="seconds"))

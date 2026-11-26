@@ -206,6 +206,8 @@ launchctl print gui/$(id -u)/com.hemory.pipeline | grep -E "state|pid"
   월 폴더에 같은 이름 오디오가 없으면 월 폴더로 옮기고, 이미 있으면 중복 사본이므로 `_trash` 로 보낸다(휴지통 30일 복원).
 - **다시 요약**: Gemini 503/429 로 요약만 실패해 제목이 "11월 26일 기록" 으로 남은 기록은
   `--resummarize --since YYYY-MM-DD [--diarize]` 로 전사문은 그대로 두고 제목·요약만 다시 만든다.
+  상주 감시는 **30분마다 오늘 기록 중 요약이 빈 것을 최대 5건** 스스로 다시 채운다(무료 티어 429/503 대비, 모델 재시도에
+  간격을 두고 **한 바퀴 더** 시도).
 - **상태 확인**: `~/.config/hemory/status.json` 에 `watch_pid`·`watch_cycles`·`watch_heartbeat_at`(10분마다)·`watch_processed_total` 이 남는다.
 - **락**: 회차마다 `~/.config/hemory/pipeline.lock` 을 잡았다 놓으므로, 수동 `--once` 나 다른 실행과 겹쳐도 한쪽만 처리한다. 3시간 넘은 락은 죽은 실행으로 보고 지운다.
 - **맥 잠자기**: 잠들면 프로세스도 멈춘다(깨어나면 launchd 가 다시 띄운다 — `KeepAlive`). 잠자기를 막으려면
